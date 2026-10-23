@@ -79,6 +79,33 @@ the HTTP listen address. Prefer `wss://` for remote ACP connections; plaintext
 connections to non-loopback hosts require `--allow-insecure`.
 Run `qmcp --help` for all options. Set `RUST_LOG=info` for connection logs.
 
+### ChatGPT
+
+Use [OpenAI Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
+for private stdio access. Your account/workspace must allow tunnels and custom MCP servers.
+
+1. Install `tunnel-client` from that guide. Create a tunnel in
+   [Platform settings](https://platform.openai.com/settings/organization/tunnels),
+   link your ChatGPT workspace, and set its runtime key in `CONTROL_PLANE_API_KEY`.
+2. With QueryMT running, set `TUNNEL_ID` to that tunnel's ID, replace the qmcp path, and run:
+
+   ```sh
+   tunnel-client init --sample sample_mcp_stdio_local --profile qmcp \
+     --tunnel-id "$TUNNEL_ID" --mcp-command "/absolute/path/to/qmcp"
+   tunnel-client doctor --profile qmcp --explain
+   tunnel-client run --profile qmcp
+   ```
+
+3. Open [ChatGPT Plugins](https://chatgpt.com/plugins), choose **+ > Add custom MCP server**,
+   name it `qmcp`, select **Connection: Tunnel**, and choose your tunnel.
+   Select **No authentication** for private stdio access, accept the warning,
+   and **Create as a plugin**. Leave `QMCP_BEARER_TOKEN` unset for this stdio process.
+4. Install the plugin, select it with `@` in a new chat, and ask:
+   **"Use qmcp to list QueryMT profiles."** Keep QueryMT and `tunnel-client` running.
+
+For authenticated public HTTPS access, ChatGPT requires [OAuth](https://developers.openai.com/plugins/build/auth),
+not a manually supplied static API key; qmcp's Bearer option alone is insufficient.
+
 ## Tools
 
 The MCP client discovers the tools and their argument schemas automatically.
