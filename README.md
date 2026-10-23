@@ -20,91 +20,10 @@ cargo install --locked --path .
 
 ## Connect
 
-Run your configured QueryMT instance with ACP WebSockets enabled:
 
-```sh
-qmtcode --acp-ws
-```
-
-The default ACP endpoint is `ws://127.0.0.1:3030/acp/ws`.
-Configure QueryMT and any required provider credentials; qmcp does not start it.
-
-### stdio
-
-Configure an MCP client to launch `qmcp`:
-
-```json
-{
-  "mcpServers": {
-    "qmcp": {
-      "command": "qmcp",
-      "args": ["--url", "ws://127.0.0.1:3030/acp/ws"]
-    }
-  }
-}
-```
-
-Use an absolute binary path if your client cannot find `qmcp` on `PATH`.
-Stdin/stdout are reserved for MCP; logs go to stderr.
-
-### Streamable HTTP
-
-```sh
-qmcp --transport http
-```
-
-Connect your MCP client to `http://127.0.0.1:3031/mcp` using **Streamable HTTP**.
-
-HTTP is unauthenticated and loopback-only by default. To require a shared token,
-set `QMCP_BEARER_TOKEN` (preferred) or pass `--bearer-token`. Configure the client
-to send `Authorization: Bearer <token>` on every request, including initialization.
-
-For remote access, set a long random token, use a TLS reverse proxy, and specify
-its public hostname:
-
-```sh
-# Supply QMCP_BEARER_TOKEN through your service's secret/environment settings.
-qmcp --transport http --bind 0.0.0.0:3031 --allowed-host mcp.example.com
-```
-
-Non-loopback binds require a token; wildcard binds also require `--allowed-host`
-(repeatable, optionally `host:port`). The proxy must forward the Authorization
-header and an allowed Host. Browser Origin headers are rejected. Bearer tokens
-grant access to all tools; they are not OAuth or per-user permissions. Never send
-tokens over public plaintext HTTP: qmcp itself does not terminate TLS. Keep the
-backend port private to the proxy with a firewall or private network.
-
-Use `--url` or `QMCP_ACP_URL` to change the ACP endpoint, and `--bind` to change
-the HTTP listen address. Prefer `wss://` for remote ACP connections; plaintext
-connections to non-loopback hosts require `--allow-insecure`.
-Run `qmcp --help` for all options. Set `RUST_LOG=info` for connection logs.
-
-### ChatGPT
-
-Use [OpenAI Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
-for private stdio access. Your account/workspace must allow tunnels and custom MCP servers.
-
-1. Install `tunnel-client` from that guide. Create a tunnel in
-   [Platform settings](https://platform.openai.com/settings/organization/tunnels),
-   link your ChatGPT workspace, and set its runtime key in `CONTROL_PLANE_API_KEY`.
-2. With QueryMT running, set `TUNNEL_ID` to that tunnel's ID, replace the qmcp path, and run:
-
-   ```sh
-   tunnel-client init --sample sample_mcp_stdio_local --profile qmcp \
-     --tunnel-id "$TUNNEL_ID" --mcp-command "/absolute/path/to/qmcp"
-   tunnel-client doctor --profile qmcp --explain
-   tunnel-client run --profile qmcp
-   ```
-
-3. Open [ChatGPT Plugins](https://chatgpt.com/plugins), choose **+ > Add custom MCP server**,
-   name it `qmcp`, select **Connection: Tunnel**, and choose your tunnel.
-   Select **No authentication** for private stdio access, accept the warning,
-   and **Create as a plugin**. Leave `QMCP_BEARER_TOKEN` unset for this stdio process.
-4. Install the plugin, select it with `@` in a new chat, and ask:
-   **"Use qmcp to list QueryMT profiles."** Keep QueryMT and `tunnel-client` running.
-
-For authenticated public HTTPS access, ChatGPT requires [OAuth](https://developers.openai.com/plugins/build/auth),
-not a manually supplied static API key; qmcp's Bearer option alone is insufficient.
+See [How to connect](docs/how-to-connect.md) for local stdio, Bearer over HTTPS,
+private tunnels, and OAuth/ChatGPT setup. The guide includes client examples,
+authentication requirements, and remote-access precautions.
 
 ## Tools
 
