@@ -46,17 +46,28 @@ impl MockAcp {
     }
 
     async fn with_handshake_delay(behavior: SubmissionBehavior, delay: Duration) -> Self {
-        Self::with_options(behavior, delay, None).await
+        Self::with_options(behavior, delay, None, None).await
     }
 
     async fn with_listing_pages(pages: usize) -> Self {
-        Self::with_options(SubmissionBehavior::Idle, Duration::ZERO, Some(pages)).await
+        Self::with_options(SubmissionBehavior::Idle, Duration::ZERO, Some(pages), None).await
+    }
+
+    async fn with_extension_payload(payload: Value) -> Self {
+        Self::with_options(
+            SubmissionBehavior::Idle,
+            Duration::ZERO,
+            None,
+            Some(payload),
+        )
+        .await
     }
 
     async fn with_options(
         behavior: SubmissionBehavior,
         delay: Duration,
         listing_pages: Option<usize>,
+        extension_payload: Option<Value>,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}/acp/ws", listener.local_addr().unwrap());
@@ -72,12 +83,13 @@ impl MockAcp {
                         let (stream, _) = accepted.unwrap();
                         let recorded = recorded.clone();
                         let active = connections.clone();
+                        let payload = extension_payload.clone();
                         tasks.spawn(async move {
                             active.fetch_add(1, Ordering::SeqCst);
                             let _guard = ConnectionGuard(active);
                             tokio::time::sleep(delay).await;
                             let socket = accept_async(stream).await.unwrap();
-                            serve_acp(socket, recorded, behavior, listing_pages).await;
+                            serve_acp(socket, recorded, behavior, listing_pages, payload).await;
                         });
                     }
                     Some(result) = tasks.join_next(), if !tasks.is_empty() => { result.unwrap(); }
@@ -131,6 +143,7 @@ async fn serve_acp(
     requests: Arc<Mutex<Vec<Value>>>,
     behavior: SubmissionBehavior,
     listing_pages: Option<usize>,
+    extension_payload: Option<Value>,
 ) {
     let mut submitted = false;
     while let Some(Ok(message)) = socket.next().await {
@@ -147,6 +160,23 @@ async fn serve_acp(
             continue;
         }
         let params = &request["params"];
+        if matches!(
+            method,
+            "_querymt/profiles"
+                | "_querymt/models"
+                | "_querymt/refreshModels"
+                | "_querymt/session/getLifecycle"
+                | "_querymt/session/setLifecycle"
+                | "_querymt/session/setPinned"
+        ) && let Some(payload) = &extension_payload
+        {
+            send(
+                &mut socket,
+                json!({"jsonrpc": "2.0", "id": id, "result": {"data": payload}}),
+            )
+            .await;
+            continue;
+        }
         let result = match method {
             "initialize" => {
                 json!({"protocolVersion": 1, "agentInfo": {"name": "fixture", "version": "1"}, "agentCapabilities": {"loadSession": true, "sessionCapabilities": {"list": {}, "resume": {}, "close": {}}}})
@@ -832,6 +862,92 @@ async fn connection_time_is_not_added_to_the_command_budget() {
 }
 
 #[tokio::test]
+async fn arbitrary_extension_payloads_cannot_override_bridge_metadata_or_panic() {
+    for http in [false, true] {
+        for payload in [
+            Value::Null,
+            json!(["profile", 1]),
+            json!("opaque"),
+            json!(42),
+            json!(false),
+            json!({"ok": false, "error": "provider-detail", "stopReason": "cancelled",
+                "textTruncated": true, "events": ["provider-event"], "droppedEvents": 99}),
+        ] {
+            let backend = MockAcp::with_extension_payload(payload.clone()).await;
+            let mut mcp = Mcp::start(&backend.url, http).await;
+            for (name, args) in [
+                ("profiles", json!({})),
+                ("models", json!({})),
+                ("models", json!({"refresh": true})),
+                ("get_lifecycle", json!({"session_id": "s"})),
+                (
+                    "set_lifecycle",
+                    json!({"session_id": "s", "resolved": false}),
+                ),
+                ("pin", json!({"session_id": "s"})),
+                ("unpin", json!({"session_id": "s"})),
+            ] {
+                let response = mcp.tool(name, args).await;
+                assert_eq!(response["isError"], false, "{name}: {response}");
+                let result = &response["structuredContent"];
+                assert_eq!(result["ok"], true);
+                assert_eq!(
+                    result["result"], payload,
+                    "{name} must preserve the extension payload"
+                );
+                assert!(result.get("error").is_none());
+                assert!(result.get("stopReason").is_none());
+                assert_eq!(result["textTruncated"], false);
+                assert_eq!(result["events"], json!([]));
+                assert_eq!(result["droppedEvents"], 0);
+                assert_eq!(
+                    serde_json::from_str::<Value>(response["content"][0]["text"].as_str().unwrap())
+                        .unwrap(),
+                    *result
+                );
+            }
+        }
+        let backend = MockAcp::with_extension_payload(json!({"models": [
+            {"id": "keep", "provider": "fixture"}, {"id": "drop", "provider": "other"},
+        ]}))
+        .await;
+        let mut mcp = Mcp::start(&backend.url, http).await;
+        for refresh in [false, true] {
+            let response = mcp
+                .tool(
+                    "models",
+                    json!({"refresh": refresh, "provider": "fixture", "query": "keep"}),
+                )
+                .await;
+            assert_eq!(
+                response["structuredContent"]["result"]["models"],
+                json!([{"id": "keep", "provider": "fixture"}])
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn session_listing_discloses_remaining_pages_on_each_return_path() {
+    for http in [false, true] {
+        for (args, cursor, truncated) in [
+            (json!({}), json!("page-2"), true),
+            (json!({"limit": 1}), json!("page-2"), true),
+            (json!({"cursor": "page-2"}), Value::Null, false),
+            (json!({"all": true}), Value::Null, false),
+        ] {
+            let backend = MockAcp::start().await;
+            let mut mcp = Mcp::start(&backend.url, http).await;
+            let response = mcp.tool("sessions", args).await;
+            assert_eq!(response["isError"], false);
+            let result = &response["structuredContent"];
+            assert_eq!(result["nextCursor"], cursor);
+            assert_eq!(result["truncated"], truncated);
+        }
+    }
+}
+
+#[tokio::test]
 async fn find_discloses_page_cap_without_claiming_an_exhaustive_search() {
     for http in [false, true] {
         for total in [19, 20, 21] {
@@ -1347,6 +1463,103 @@ async fn cli_token_allows_wildcard_binding_with_only_explicit_public_hosts() {
     assert!(backend.recorded().is_empty());
     child.start_kill().unwrap();
     child.wait().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn second_interrupt_forces_exit_during_a_stalled_http_call() {
+    let backend = MockAcp::start().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bind = listener.local_addr().unwrap();
+    drop(listener);
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_qmcp"))
+        .args([
+            "--transport",
+            "http",
+            "--bind",
+            &bind.to_string(),
+            "--url",
+            &backend.url,
+        ])
+        .env_remove("QMCP_BEARER_TOKEN")
+        .env_remove("QMCP_OAUTH_CLIENT_SECRET")
+        .env("RUST_LOG", "warn")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stderr = BufReader::new(child.stderr.take().unwrap()).lines();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let url = format!("http://{bind}/mcp");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if client.get(&url).send().await.is_ok() {
+                break;
+            }
+            assert!(child.try_wait().unwrap().is_none());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let pending =
+        tokio::spawn(async move {
+            client.post(url).header("accept", "application/json, text/event-stream")
+            .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+                "name": "prompt", "arguments": {"new": true, "text": "wait", "timeout": 120},
+            }})).send().await
+        });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !backend
+            .recorded()
+            .iter()
+            .any(|r| r["method"] == "session/prompt")
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let pid = child.id().unwrap().to_string();
+    for interrupt in 0..2 {
+        // Only signal the child owned by this test, never the test runner or user services.
+        let status = tokio::process::Command::new("sh")
+            .args(["-c", "kill -INT \"$1\"", "qmcp-test", &pid])
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+        if interrupt == 0 {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while let Some(line) = stderr.next_line().await.unwrap() {
+                    if line.contains("interrupt again to force exit") {
+                        return;
+                    }
+                }
+                panic!("shutdown acknowledgement missing");
+            })
+            .await
+            .expect("first interrupt must start graceful shutdown");
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "first interrupt must allow in-flight work to finish"
+            );
+        }
+    }
+    let status = tokio::time::timeout(Duration::from_secs(2), child.wait())
+        .await
+        .expect("second interrupt must not wait for the long request")
+        .unwrap();
+    assert_eq!(status.code(), Some(130));
+    tokio::time::timeout(Duration::from_secs(2), pending)
+        .await
+        .unwrap()
+        .unwrap()
+        .ok();
+    backend.wait_disconnected().await;
+    assert_no_implicit_cancel(&backend);
 }
 
 #[tokio::test]

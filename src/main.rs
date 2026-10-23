@@ -117,13 +117,44 @@ async fn main() -> Result<()> {
                 .context("bind Streamable HTTP listener")?;
             tracing::info!(address = %listener.local_addr()?, "serving MCP at /mcp");
             axum::serve(listener, router)
-                .with_graceful_shutdown(async {
-                    let _ = tokio::signal::ctrl_c().await;
-                })
+                .with_graceful_shutdown(shutdown_signal())
                 .await
                 .context("serve Streamable HTTP")
         }
     }
+}
+
+async fn shutdown_signal() {
+    // Keep the same Unix listener across both signals so an immediate second
+    // interrupt is queued even before the forced-exit task is polled.
+    #[cfg(unix)]
+    let mut interrupts =
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+            Ok(interrupts) => interrupts,
+            Err(error) => {
+                tracing::error!(%error, "cannot listen for shutdown interrupts");
+                return;
+            }
+        };
+    #[cfg(unix)]
+    if interrupts.recv().await.is_none() {
+        return;
+    }
+    #[cfg(not(unix))]
+    if tokio::signal::ctrl_c().await.is_err() {
+        return;
+    }
+
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        let interrupted = interrupts.recv().await.is_some();
+        #[cfg(not(unix))]
+        let interrupted = tokio::signal::ctrl_c().await.is_ok();
+        if interrupted {
+            std::process::exit(130);
+        }
+    });
+    tracing::warn!("shutting down; interrupt again to force exit");
 }
 
 #[cfg(test)]

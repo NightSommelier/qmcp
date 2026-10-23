@@ -644,7 +644,7 @@ async fn profiles(client: &AcpClient) -> Result<Value, CliError> {
         .extension("querymt/profiles", json!({}))
         .await
         .map_err(CliError::from_request)?;
-    Ok(extension_payload(&response))
+    Ok(json!({ "result": extension_payload(&response) }))
 }
 
 async fn models(
@@ -666,11 +666,11 @@ async fn models(
         .extension(method, params)
         .await
         .map_err(CliError::from_request)?;
-    Ok(session::filter_models(
+    Ok(json!({ "result": session::filter_models(
         extension_payload(&response),
         query.as_deref(),
         provider.as_deref(),
-    ))
+    ) }))
 }
 
 async fn new_session(
@@ -761,7 +761,7 @@ async fn sessions(
                     "cwd": cwd,
                     "sessions": sessions,
                     "nextCursor": next_cursor,
-                    "truncated": false,
+                    "truncated": next_cursor.is_some(),
                 }));
             }
         }
@@ -942,7 +942,7 @@ async fn get_lifecycle(client: &AcpClient, session_id: String) -> Result<Value, 
         )
         .await
         .map_err(CliError::from_request)?;
-    Ok(extension_payload(&response))
+    Ok(json!({ "result": extension_payload(&response) }))
 }
 
 fn lifecycle_patch_params(
@@ -977,7 +977,7 @@ async fn set_lifecycle(
         .extension("querymt/session/setLifecycle", params)
         .await
         .map_err(CliError::from_request)?;
-    Ok(extension_payload(&response))
+    Ok(json!({ "result": extension_payload(&response) }))
 }
 
 async fn set_pinned(
@@ -993,7 +993,7 @@ async fn set_pinned(
         )
         .await
         .map_err(CliError::from_request)?;
-    Ok(extension_payload(&response))
+    Ok(json!({ "result": extension_payload(&response) }))
 }
 
 async fn inspect(

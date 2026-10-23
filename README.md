@@ -45,7 +45,8 @@ Start with `caps`, `profiles`, and `models` to discover available capabilities.
 
 Use `prompt` with `new: true` to start a session, then its returned `sessionId`
 as `session_id` to continue. Pass an explicit `cwd` for workspace operations;
-paths refer to the QueryMT host.
+paths refer to the QueryMT host. `profiles`, `models`, lifecycle, and pin tools
+return provider data under `result`, separate from bridge status and event metadata.
 
 ## Important Behavior
 
