@@ -54,12 +54,25 @@ qmcp --transport http
 ```
 
 Connect your MCP client to `http://127.0.0.1:3031/mcp` using **Streamable HTTP**.
-Responses are JSON; there is no legacy SSE endpoint.
 
-HTTP is loopback-only and has no built-in authentication. For remote access,
-use an authenticated TLS reverse proxy forwarding an allowed loopback Host.
-Browser Origin headers are rejected. Do not expose the server openly: its
-tools can execute work through your QueryMT instance.
+HTTP is unauthenticated and loopback-only by default. To require a shared token,
+set `QMCP_BEARER_TOKEN` (preferred) or pass `--bearer-token`. Configure the client
+to send `Authorization: Bearer <token>` on every request, including initialization.
+
+For remote access, set a long random token, use a TLS reverse proxy, and specify
+its public hostname:
+
+```sh
+# Supply QMCP_BEARER_TOKEN through your service's secret/environment settings.
+qmcp --transport http --bind 0.0.0.0:3031 --allowed-host mcp.example.com
+```
+
+Non-loopback binds require a token; wildcard binds also require `--allowed-host`
+(repeatable, optionally `host:port`). The proxy must forward the Authorization
+header and an allowed Host. Browser Origin headers are rejected. Bearer tokens
+grant access to all tools; they are not OAuth or per-user permissions. Never send
+tokens over public plaintext HTTP: qmcp itself does not terminate TLS. Keep the
+backend port private to the proxy with a firewall or private network.
 
 Use `--url` or `QMCP_ACP_URL` to change the ACP endpoint, and `--bind` to change
 the HTTP listen address. Prefer `wss://` for remote ACP connections; plaintext

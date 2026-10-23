@@ -2,7 +2,8 @@
 
 - Keep code, comments, documentation, and diagnostics in English.
 - The project, crate, and binary are named `qmcp` (lowercase).
-- Support only stdio and Streamable HTTP. Do not add a legacy SSE transport.
+- Support only stdio and Streamable HTTP.
+- Require Bearer-token authentication for non-loopback HTTP binds; preserve Host/Origin validation and never log credentials.
 - Keep stdout exclusively for MCP JSON-RPC in stdio mode; diagnostics use stderr.
 - Use the flake devShell on NixOS (`nix develop -c ...`) and the declared Rust toolchain.
 - Run `cargo check`, formatting checks, Clippy, and relevant tests before finishing.

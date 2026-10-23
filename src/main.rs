@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use qmcp::{BridgeConfig, QmcpServer, policy::PermissionPolicy, transport};
 use tracing_subscriber::EnvFilter;
@@ -17,7 +17,7 @@ enum Transport {
 #[derive(Parser)]
 #[command(name = "qmcp", version = VERSION, about = "MCP server for a running QueryMT ACP WebSocket server")]
 struct Cli {
-    /// MCP transport: stdio or Streamable HTTP. No legacy SSE transport.
+    /// MCP transport: stdio or Streamable HTTP.
     #[arg(long, value_enum, default_value = "stdio")]
     transport: Transport,
 
@@ -38,9 +38,17 @@ struct Cli {
     #[arg(long, value_enum, default_value = "allow-once")]
     permission: PermissionPolicy,
 
-    /// Streamable HTTP listen address. Loopback only; use a secured reverse proxy for remote access.
+    /// Streamable HTTP listen address. Non-loopback binds require a bearer token.
     #[arg(long, default_value = "127.0.0.1:3031")]
     bind: SocketAddr,
+
+    /// Shared HTTP bearer token. Prefer the environment variable to keep it out of argv.
+    #[arg(long, env = "QMCP_BEARER_TOKEN", hide_env_values = true)]
+    bearer_token: Option<String>,
+
+    /// Additional allowed HTTP hostname or host:port (repeatable; requires a token).
+    #[arg(long = "allowed-host", action = clap::ArgAction::Append)]
+    allowed_hosts: Vec<String>,
 }
 
 #[tokio::main]
@@ -59,9 +67,19 @@ async fn main() -> Result<()> {
         cli.permission,
     )?)?;
     match cli.transport {
-        Transport::Stdio => transport::serve_stdio(server).await,
+        Transport::Stdio => {
+            if cli.bearer_token.is_some() || !cli.allowed_hosts.is_empty() {
+                bail!("HTTP authentication options require --transport http");
+            }
+            transport::serve_stdio(server).await
+        }
         Transport::Http => {
-            let router = transport::http_router_for_addr(server, cli.bind)?;
+            let token = cli
+                .bearer_token
+                .map(|value| transport::BearerToken::new(&value))
+                .transpose()?;
+            let router =
+                transport::http_router_with_auth(server, cli.bind, token, &cli.allowed_hosts)?;
             let listener = tokio::net::TcpListener::bind(cli.bind)
                 .await
                 .context("bind Streamable HTTP listener")?;

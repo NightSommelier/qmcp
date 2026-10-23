@@ -268,26 +268,48 @@ enum Mcp {
 
 impl Mcp {
     async fn start(backend: &str, http: bool) -> Self {
+        Self::start_with_token(backend, http, None).await
+    }
+
+    async fn start_with_token(backend: &str, http: bool, token: Option<&str>) -> Self {
         let mut mcp = if http {
             let server = QmcpServer::new(
                 BridgeConfig::new(backend, false, PermissionPolicy::AllowOnce).unwrap(),
             )
             .unwrap();
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+            let bind = listener.local_addr().unwrap();
+            let url = format!("http://{bind}/mcp");
+            let router = transport::http_router_with_auth(
+                server,
+                bind,
+                token.map(|value| transport::BearerToken::new(value).unwrap()),
+                &[],
+            )
+            .unwrap();
             let task = tokio::spawn(async move {
-                axum::serve(listener, transport::http_router(server))
-                    .await
-                    .unwrap();
+                axum::serve(listener, router).await.unwrap();
             });
+            let mut headers = reqwest::header::HeaderMap::new();
+            if let Some(token) = token {
+                let mut value =
+                    reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).unwrap();
+                value.set_sensitive(true);
+                headers.insert(reqwest::header::AUTHORIZATION, value);
+            }
             Self::Http {
-                client: reqwest::Client::new(),
+                client: reqwest::Client::builder()
+                    .no_proxy()
+                    .default_headers(headers)
+                    .build()
+                    .unwrap(),
                 url,
                 task,
             }
         } else {
             let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_qmcp"))
                 .args(["--url", backend])
+                .env_remove("QMCP_BEARER_TOKEN")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit())
@@ -476,7 +498,7 @@ async fn stdio_bridges_native_acp_operations() {
 }
 
 #[tokio::test]
-async fn streamable_http_bridges_native_acp_operations_without_sse() {
+async fn streamable_http_bridges_native_acp_operations() {
     exercise_bridge(true).await;
 }
 
@@ -976,6 +998,7 @@ async fn cli_http_accepts_the_selected_alternate_loopback_host_only() {
             "--url",
             &backend.url,
         ])
+        .env_remove("QMCP_BEARER_TOKEN")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -1051,7 +1074,283 @@ async fn cli_http_accepts_the_selected_alternate_loopback_host_only() {
 }
 
 #[tokio::test]
-async fn http_rejects_event_streams_and_untrusted_hosts_and_origins() {
+async fn bearer_auth_guards_every_http_request_before_protocol_or_backend_work() {
+    const TOKEN: &str = "fixture-token-0123456789abcdef0123456789abcdef";
+    let backend = MockAcp::start().await;
+    let mut mcp = Mcp::start_with_token(&backend.url, true, Some(TOKEN)).await;
+    let Mcp::Http { url, .. } = &mcp else {
+        unreachable!()
+    };
+    let url = url.clone();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let request = json!({"jsonrpc": "2.0", "id": 11, "method": "tools/call", "params": {
+        "name": "new", "arguments": {},
+    }});
+    for authorization in [
+        None,
+        Some("Bearer wrong"),
+        Some(TOKEN),
+        Some("Basic ignored"),
+        Some("Bearer"),
+        Some("Bearer "),
+        Some("Bearer wrong extra"),
+    ] {
+        let mut builder = client
+            .post(&url)
+            .header("accept", "application/json, text/event-stream")
+            .json(&request);
+        if let Some(value) = authorization {
+            builder = builder.header("authorization", value);
+        }
+        let response = builder.send().await.unwrap();
+        assert_eq!(response.status(), 401);
+        assert_eq!(
+            response.headers()["www-authenticate"],
+            "Bearer realm=\"qmcp\""
+        );
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let body = response.text().await.unwrap();
+        assert_eq!(body, "unauthorized");
+        assert!(!body.contains(TOKEN));
+    }
+    let response = client
+        .post(format!("{url}?access_token={TOKEN}"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        401,
+        "query parameters must not authenticate"
+    );
+    for method in [
+        reqwest::Method::GET,
+        reqwest::Method::DELETE,
+        reqwest::Method::OPTIONS,
+        reqwest::Method::HEAD,
+    ] {
+        assert_eq!(
+            client.request(method, &url).send().await.unwrap().status(),
+            401
+        );
+    }
+    let response = client
+        .post(&url)
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        401,
+        "ambiguous duplicate credentials must fail closed"
+    );
+    let response = client.post(&url).body("invalid JSON").send().await.unwrap();
+    assert_eq!(
+        response.status(),
+        401,
+        "authentication precedes protocol/body parsing"
+    );
+    assert!(
+        backend.recorded().is_empty(),
+        "unauthorized requests must not perform backend work"
+    );
+    for (header, value) in [
+        ("host", "untrusted.invalid"),
+        ("origin", "https://untrusted.invalid"),
+    ] {
+        let response = client
+            .post(&url)
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .header("accept", "application/json, text/event-stream")
+            .header(header, value)
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            403,
+            "a valid token must not bypass Host/Origin checks"
+        );
+    }
+    let created = mcp.tool("new", json!({})).await;
+    assert_eq!(created["isError"], false);
+    assert_eq!(created["structuredContent"]["sessionId"], "fixture-session");
+    let response = client.post(&url).json(&request).send().await.unwrap();
+    assert_eq!(
+        response.status(),
+        401,
+        "a previously authorized request must not authorize later calls"
+    );
+    assert_eq!(
+        backend
+            .recorded()
+            .iter()
+            .filter(|r| r["method"] == "session/new")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn cli_auth_configuration_fails_closed_without_leaking_the_token() {
+    const TOKEN: &str = "fixture-token-must-not-appear-in-diagnostics-0123456789";
+    let cases: &[(&[&str], Option<&str>)] = &[
+        (&["--transport", "http", "--bind", "0.0.0.0:0"], None),
+        (
+            &[
+                "--transport",
+                "http",
+                "--bind",
+                "0.0.0.0:0",
+                "--allowed-host",
+                "mcp.example.com",
+            ],
+            None,
+        ),
+        (&["--transport", "http", "--bind", "0.0.0.0:0"], Some(TOKEN)),
+        (&["--transport", "http", "--bind", "127.0.0.1:0"], Some("")),
+        (
+            &["--transport", "http", "--bearer-token", "bad token"],
+            None,
+        ),
+        (&["--transport", "stdio"], Some(TOKEN)),
+        (
+            &[
+                "--transport",
+                "http",
+                "--bind",
+                "0.0.0.0:0",
+                "--allowed-host",
+                "*",
+            ],
+            Some(TOKEN),
+        ),
+    ];
+    for (args, token) in cases {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_qmcp"));
+        command
+            .args(*args)
+            .env_remove("QMCP_BEARER_TOKEN")
+            .kill_on_drop(true)
+            .stdin(Stdio::null());
+        if let Some(token) = token {
+            command.env("QMCP_BEARER_TOKEN", token);
+        }
+        let output = tokio::time::timeout(Duration::from_secs(3), command.output())
+            .await
+            .expect("invalid HTTP config must fail before listening")
+            .unwrap();
+        assert!(!output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stdout.is_empty(), "startup errors must not pollute stdout");
+        assert!(!stderr.contains(TOKEN));
+        assert!(!stderr.contains("bad token"));
+    }
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_qmcp"))
+        .arg("--help")
+        .env("QMCP_BEARER_TOKEN", TOKEN)
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(help.contains("QMCP_BEARER_TOKEN"));
+    assert!(
+        !help.contains(TOKEN),
+        "help must hide the token's environment value"
+    );
+}
+
+#[tokio::test]
+async fn cli_token_allows_wildcard_binding_with_only_explicit_public_hosts() {
+    const TOKEN: &str = "fixture-public-token-0123456789abcdef0123456789";
+    let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let bind = listener.local_addr().unwrap();
+    drop(listener);
+    let backend = MockAcp::start().await;
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_qmcp"))
+        .args([
+            "--transport",
+            "http",
+            "--bind",
+            &bind.to_string(),
+            "--allowed-host",
+            "mcp.example.com:443",
+            "--url",
+            &backend.url,
+        ])
+        .env("QMCP_BEARER_TOKEN", TOKEN)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .unwrap();
+    let url = format!("http://127.0.0.1:{}/mcp", bind.port());
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if client.get(&url).send().await.is_ok() {
+                break;
+            }
+            assert!(child.try_wait().unwrap().is_none());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("authenticated HTTP listener must start");
+    let request = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "public-fixture", "version": "1"},
+    }});
+    assert_eq!(
+        client
+            .post(&url)
+            .header("host", "mcp.example.com:443")
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    for (host, status) in [
+        ("mcp.example.com:443", 200),
+        ("mcp.example.com:444", 403),
+        ("evil.example.com:443", 403),
+        ("0.0.0.0", 403),
+    ] {
+        let response = client
+            .post(&url)
+            .bearer_auth(TOKEN)
+            .header("host", host)
+            .header("accept", "application/json, text/event-stream")
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            status,
+            "public Host validation must remain exact"
+        );
+    }
+    assert!(backend.recorded().is_empty());
+    child.start_kill().unwrap();
+    child.wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn http_rejects_unsupported_methods_and_untrusted_hosts_and_origins() {
     let backend = MockAcp::start().await;
     let mcp = Mcp::start(&backend.url, true).await;
     let Mcp::Http { client, url, .. } = &mcp else {
@@ -1060,7 +1359,7 @@ async fn http_rejects_event_streams_and_untrusted_hosts_and_origins() {
     assert_eq!(
         client
             .get(url)
-            .header("accept", "text/event-stream")
+            .header("accept", "application/json")
             .send()
             .await
             .unwrap()
@@ -1069,7 +1368,7 @@ async fn http_rejects_event_streams_and_untrusted_hosts_and_origins() {
     );
     assert_eq!(
         client
-            .get(url.replace("/mcp", "/sse"))
+            .get(url.replace("/mcp", "/unknown"))
             .send()
             .await
             .unwrap()
