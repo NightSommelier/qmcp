@@ -5,6 +5,7 @@ mod output;
 
 pub use qmacp::policy;
 
+pub mod oauth;
 pub mod server;
 pub mod transport;
 

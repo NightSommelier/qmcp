@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
@@ -38,15 +38,33 @@ struct Cli {
     #[arg(long, value_enum, default_value = "allow-once")]
     permission: PermissionPolicy,
 
-    /// Streamable HTTP listen address. Non-loopback binds require a bearer token.
+    /// Streamable HTTP listen address. Non-loopback binds require authentication.
     #[arg(long, default_value = "127.0.0.1:3031")]
     bind: SocketAddr,
 
     /// Shared HTTP bearer token. Prefer the environment variable to keep it out of argv.
-    #[arg(long, env = "QMCP_BEARER_TOKEN", hide_env_values = true)]
+    #[arg(
+        long,
+        env = "QMCP_BEARER_TOKEN",
+        hide_env_values = true,
+        conflicts_with = "oauth_config"
+    )]
     bearer_token: Option<String>,
 
-    /// Additional allowed HTTP hostname or host:port (repeatable; requires a token).
+    /// OAuth resource/provider JSON configuration (HTTP only; see README).
+    #[arg(long, requires = "oauth_client_secret")]
+    oauth_config: Option<PathBuf>,
+
+    /// Introspection client secret. Prefer the environment variable.
+    #[arg(
+        long,
+        env = "QMCP_OAUTH_CLIENT_SECRET",
+        hide_env_values = true,
+        requires = "oauth_config"
+    )]
+    oauth_client_secret: Option<String>,
+
+    /// Additional allowed HTTP hostname or host:port (repeatable; requires auth).
     #[arg(long = "allowed-host", action = clap::ArgAction::Append)]
     allowed_hosts: Vec<String>,
 }
@@ -68,7 +86,10 @@ async fn main() -> Result<()> {
     )?)?;
     match cli.transport {
         Transport::Stdio => {
-            if cli.bearer_token.is_some() || !cli.allowed_hosts.is_empty() {
+            if cli.bearer_token.is_some()
+                || cli.oauth_config.is_some()
+                || !cli.allowed_hosts.is_empty()
+            {
                 bail!("HTTP authentication options require --transport http");
             }
             transport::serve_stdio(server).await
@@ -78,8 +99,19 @@ async fn main() -> Result<()> {
                 .bearer_token
                 .map(|value| transport::BearerToken::new(&value))
                 .transpose()?;
-            let router =
-                transport::http_router_with_auth(server, cli.bind, token, &cli.allowed_hosts)?;
+            let router = if let Some(path) = cli.oauth_config {
+                let bytes = tokio::fs::read(path)
+                    .await
+                    .context("read OAuth configuration")?;
+                let config = serde_json::from_slice(&bytes).context("parse OAuth configuration")?;
+                let secret = cli
+                    .oauth_client_secret
+                    .context("OAuth client secret is required")?;
+                let auth = qmcp::oauth::OAuthAuth::new(config, secret)?;
+                transport::http_router_with_oauth(server, cli.bind, auth, &cli.allowed_hosts)?
+            } else {
+                transport::http_router_with_auth(server, cli.bind, token, &cli.allowed_hosts)?
+            };
             let listener = tokio::net::TcpListener::bind(cli.bind)
                 .await
                 .context("bind Streamable HTTP listener")?;
@@ -91,5 +123,44 @@ async fn main() -> Result<()> {
                 .await
                 .context("serve Streamable HTTP")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oauth_configuration_requires_a_secret_and_cannot_fall_back_to_a_static_token() {
+        for args in [
+            vec!["qmcp", "--oauth-config", "oauth.json"],
+            vec!["qmcp", "--oauth-client-secret", "test-secret"],
+            vec![
+                "qmcp",
+                "--oauth-config",
+                "oauth.json",
+                "--oauth-client-secret",
+                "test-secret",
+                "--bearer-token",
+                "static-token",
+            ],
+        ] {
+            let error = Cli::try_parse_from(args)
+                .err()
+                .expect("partial/conflicting OAuth must fail");
+            assert!(!error.to_string().contains("test-secret"));
+        }
+        assert!(
+            Cli::try_parse_from([
+                "qmcp",
+                "--transport",
+                "http",
+                "--oauth-config",
+                "oauth.json",
+                "--oauth-client-secret",
+                "test-secret"
+            ])
+            .is_ok()
+        );
     }
 }

@@ -11,6 +11,7 @@ use axum::{
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
+    routing::get,
 };
 use rmcp::{
     ServiceExt,
@@ -24,7 +25,10 @@ use rmcp::{
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use crate::QmcpServer;
+use crate::{
+    QmcpServer,
+    oauth::{self, OAuthAuth},
+};
 
 /// Shared HTTP credential. Only a digest is retained; Debug never reveals it.
 #[derive(Clone)]
@@ -46,26 +50,23 @@ impl BearerToken {
     }
 
     fn accepts(&self, headers: &HeaderMap) -> bool {
-        let mut values = headers.get_all(AUTHORIZATION).iter();
-        let Some(value) = values.next() else {
+        let Some(credential) = bearer_credential(headers) else {
             return false;
         };
-        if values.next().is_some() {
-            return false;
-        }
-        let Ok(value) = value.to_str() else {
-            return false;
-        };
-        let Some((scheme, credential)) = value.split_once(' ') else {
-            return false;
-        };
-        let credential = credential.trim_start_matches(' ');
-        if !scheme.eq_ignore_ascii_case("Bearer") || !valid_token(credential) {
-            return false;
-        }
         let actual: [u8; 32] = Sha256::digest(credential.as_bytes()).into();
         bool::from(self.0.ct_eq(&actual))
     }
+}
+
+pub(crate) fn bearer_credential(headers: &HeaderMap) -> Option<&str> {
+    let mut values = headers.get_all(AUTHORIZATION).iter();
+    let value = values.next()?.to_str().ok()?;
+    if values.next().is_some() {
+        return None;
+    }
+    let (scheme, credential) = value.split_once(' ')?;
+    let credential = credential.trim_start_matches(' ');
+    (scheme.eq_ignore_ascii_case("Bearer") && valid_token(credential)).then_some(credential)
 }
 
 fn valid_token(value: &str) -> bool {
@@ -134,6 +135,52 @@ pub fn http_router_with_auth(
         Some(token) => router.layer(middleware::from_fn_with_state(token, require_bearer)),
         None => router,
     })
+}
+
+/// Protect MCP requests with external-provider OAuth; discovery remains public.
+/// TLS must terminate at the public resource URL configured in OAuthAuth.
+pub fn http_router_with_oauth(
+    server: QmcpServer,
+    bind: SocketAddr,
+    auth: OAuthAuth,
+    allowed_hosts: &[String],
+) -> Result<Router> {
+    let config = http_config(bind, true, allowed_hosts)?;
+    let discovery =
+        get(oauth::metadata)
+            .with_state(auth.clone())
+            .layer(middleware::from_fn_with_state(
+                config.allowed_hosts.clone(),
+                guard_discovery,
+            ));
+    Ok(build_http_router(server, config)
+        .layer(middleware::from_fn_with_state(auth, oauth::require_oauth))
+        .route("/.well-known/oauth-protected-resource", discovery.clone())
+        .route("/.well-known/oauth-protected-resource/mcp", discovery))
+}
+
+async fn guard_discovery(
+    State(hosts): State<Vec<String>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let authority = request
+        .headers()
+        .get("host")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.parse::<Authority>().ok());
+    let allowed = authority.is_some_and(|authority| {
+        hosts.iter().any(|host| {
+            host.eq_ignore_ascii_case(authority.as_str())
+                || host
+                    .trim_matches(['[', ']'])
+                    .eq_ignore_ascii_case(authority.host().trim_matches(['[', ']']))
+        })
+    });
+    if !allowed || request.headers().contains_key("origin") {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    next.run(request).await
 }
 
 fn http_config(
