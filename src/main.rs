@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use qmcp::{BridgeConfig, QmcpServer, policy::PermissionPolicy, transport};
 use tracing_subscriber::EnvFilter;
@@ -61,16 +61,12 @@ async fn main() -> Result<()> {
     match cli.transport {
         Transport::Stdio => transport::serve_stdio(server).await,
         Transport::Http => {
-            if !cli.bind.ip().is_loopback() {
-                bail!(
-                    "HTTP must bind to a loopback address; use an authenticated TLS reverse proxy for remote access"
-                );
-            }
+            let router = transport::http_router_for_addr(server, cli.bind)?;
             let listener = tokio::net::TcpListener::bind(cli.bind)
                 .await
                 .context("bind Streamable HTTP listener")?;
             tracing::info!(address = %listener.local_addr()?, "serving MCP at /mcp");
-            axum::serve(listener, transport::http_router(server))
+            axum::serve(listener, router)
                 .with_graceful_shutdown(async {
                     let _ = tokio::signal::ctrl_c().await;
                 })

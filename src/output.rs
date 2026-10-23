@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
-use serde_json::{Value, json};
+use qmacp::error::CliError;
+use serde_json::{Map, Value, json};
 
 const MAX_EVENTS: usize = 256;
 const MAX_EVENT_BYTES: usize = 1024 * 1024;
@@ -41,11 +42,82 @@ impl EventLog {
     }
 }
 
-pub fn ok(mut value: Value) -> Value {
-    if let Some(object) = value.as_object_mut() {
-        object.insert("ok".into(), json!(true));
-    }
+pub(crate) fn failed(value: &Value) -> bool {
+    value.get("ok") == Some(&Value::Bool(false))
+        || value.get("error").is_some()
+        || value.get("stopReason").and_then(Value::as_str) == Some("cancelled")
+}
+
+pub(crate) fn normalize(mut value: Value) -> Value {
+    let ok = !failed(&value);
+    value["ok"] = json!(ok);
     value
+}
+
+pub(crate) fn failure(error: CliError) -> Value {
+    json!({ "ok": false, "error": error.to_string(), "code": error.exit_code().as_i32() })
+}
+
+/// Recovery checkpoints outlive the command future and cannot be evicted by events.
+#[derive(Default)]
+pub(crate) struct OperationState {
+    pub recovery: Map<String, Value>,
+    pub batch: Option<BatchState>,
+}
+
+#[derive(Default)]
+pub(crate) struct BatchState {
+    pub results: Vec<Value>,
+    pub active_call: Option<String>,
+    pub text_truncated: bool,
+}
+
+impl OperationState {
+    pub fn session(&mut self, session_id: &str, cwd: &std::path::Path, created: bool) {
+        self.recovery.insert("sessionId".into(), json!(session_id));
+        self.recovery.insert("cwd".into(), json!(cwd));
+        self.recovery
+            .insert("sessionCreated".into(), json!(created));
+    }
+
+    pub fn submission_started(&mut self, session_id: &str, input_id: &str, delivery: &str) {
+        self.recovery.insert("sessionId".into(), json!(session_id));
+        self.recovery.insert(
+            "submission".into(),
+            json!({
+                "clientInputId": input_id, "delivery": delivery, "state": "unconfirmed",
+            }),
+        );
+    }
+
+    pub fn submission_acknowledged(&mut self, result: &Value) {
+        let submission = self
+            .recovery
+            .get_mut("submission")
+            .expect("submission checkpoint exists");
+        submission["state"] = json!("acknowledged");
+        submission["acknowledgement"] = result.clone();
+    }
+
+    pub fn attach_recovery(&self, mut result: Value) -> Value {
+        if failed(&result) && !self.recovery.is_empty() {
+            result["recovery"] = json!(self.recovery);
+        }
+        result
+    }
+
+    pub fn finish(self, result: Value) -> Value {
+        let mut result = self.attach_recovery(result);
+        if let Some(batch) = self.batch {
+            if result.get("results").is_none() {
+                result["results"] = json!(batch.results);
+                result["failedCall"] = json!(batch.active_call);
+            }
+            let truncated = batch.text_truncated || result["textTruncated"] == true;
+            result["textTruncated"] = json!(truncated);
+        }
+        normalize(result)
+    }
 }
 
 #[cfg(test)]

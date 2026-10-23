@@ -3,11 +3,21 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use qmacp::protocol::schema::v1 as acp;
-use schemars::JsonSchema;
+use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use qmacp::{client::AcpClient, error::CliError, session};
+
+use crate::output::{self, BatchState, OperationState};
+
+const MIN_SECONDS: u64 = 1;
+const MAX_SECONDS: u64 = 86_400;
+const MIN_BATCH_CALLS: usize = 1;
+const MAX_BATCH_CALLS: usize = 100;
+// Match Rust's Unicode whitespace set, rather than a regex engine's differing \\s.
+const NON_BLANK_TEXT_PATTERN: &str =
+    r"[^\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -97,6 +107,7 @@ pub enum Command {
         pinned: Option<bool>,
     },
     /// Search sessions by title/id/cwd and optionally filter by phase, lifecycle, or pin.
+    /// Scans at most 20 pages. Check truncated and scanLimitReached before treating results as exhaustive.
     Find {
         cwd: Option<PathBuf>,
         query: Option<String>,
@@ -259,8 +270,8 @@ pub fn decode(name: &str, mut arguments: Map<String, Value>) -> Result<Command> 
             interval, timeout, ..
         } => {
             validate_timeout(*timeout)?;
-            if *interval == 0 || *interval > 86_400 {
-                bail!("interval must be between 1 and 86400 seconds");
+            if !(MIN_SECONDS..=MAX_SECONDS).contains(interval) {
+                bail!("interval must be between {MIN_SECONDS} and {MAX_SECONDS} seconds");
             }
         }
         Command::SetLifecycle {
@@ -269,8 +280,8 @@ pub fn decode(name: &str, mut arguments: Map<String, Value>) -> Result<Command> 
             ..
         } => bail!("at least one of resolved or archived is required"),
         Command::Exec { calls } => {
-            if calls.is_empty() || calls.len() > 100 {
-                bail!("exec requires between 1 and 100 calls");
+            if !(MIN_BATCH_CALLS..=MAX_BATCH_CALLS).contains(&calls.len()) {
+                bail!("exec requires between {MIN_BATCH_CALLS} and {MAX_BATCH_CALLS} calls");
             }
             // Validate every call before executing any side effects.
             for call in calls {
@@ -286,13 +297,163 @@ pub fn decode(name: &str, mut arguments: Map<String, Value>) -> Result<Command> 
 }
 
 fn validate_timeout(timeout: u64) -> Result<()> {
-    if !(1..=86_400).contains(&timeout) {
-        bail!("timeout must be between 1 and 86400 seconds");
+    if !(MIN_SECONDS..=MAX_SECONDS).contains(&timeout) {
+        bail!("timeout must be between {MIN_SECONDS} and {MAX_SECONDS} seconds");
     }
     Ok(())
 }
 
-pub async fn run(client: &AcpClient, command: Command) -> Result<Value, CliError> {
+/// Build self-contained argument schemas from the deserialized types plus the
+/// same bounds and semantic choices enforced by decode().
+pub fn input_schemas() -> Result<Vec<(String, Map<String, Value>)>> {
+    let mut settings = SchemaSettings::draft2020_12();
+    settings.inline_subschemas = true;
+    let schema = settings
+        .into_generator()
+        .into_root_schema_for::<Command>()
+        .to_value();
+    let variants = schema
+        .get("oneOf")
+        .and_then(Value::as_array)
+        .context("command schema must contain oneOf")?;
+    let mut inputs = Vec::with_capacity(variants.len());
+    for variant in variants {
+        let mut input = variant
+            .as_object()
+            .cloned()
+            .context("command variant must be an object")?;
+        let properties = input
+            .get_mut("properties")
+            .and_then(Value::as_object_mut)
+            .context("command variant must have properties")?;
+        let tag = properties
+            .remove("command")
+            .context("command variant must have a discriminator")?;
+        let name = tag
+            .get("const")
+            .and_then(Value::as_str)
+            .context("command discriminator must be constant")?
+            .to_owned();
+        if let Some(required) = input.get_mut("required").and_then(Value::as_array_mut) {
+            required.retain(|field| field != "command");
+        }
+        constrain_input_schema(&name, &mut input);
+        inputs.push((name, input));
+    }
+    // Each batch entry embeds the corresponding tool's full argument contract.
+    // Exclude exec itself so its schema cannot advertise recursive batches.
+    let entries: Vec<_> = inputs
+        .iter()
+        .filter(|(name, _)| name != "exec")
+        .map(|(name, input)| {
+            let mut entry = json!({
+                "type": "object", "additionalProperties": false, "required": ["name"],
+                "properties": {"name": {"const": name}, "arguments": input},
+            });
+            if decode(name, Map::new()).is_err() {
+                entry["required"] = json!(["name", "arguments"]);
+            }
+            entry
+        })
+        .collect();
+    let (_, exec) = inputs
+        .iter_mut()
+        .find(|(name, _)| name == "exec")
+        .context("exec schema must exist")?;
+    let calls = &mut exec
+        .get_mut("properties")
+        .context("exec properties must exist")?["calls"];
+    calls["minItems"] = json!(MIN_BATCH_CALLS);
+    calls["maxItems"] = json!(MAX_BATCH_CALLS);
+    calls["items"] = json!({"oneOf": entries});
+    Ok(inputs)
+}
+
+fn constrain_input_schema(name: &str, input: &mut Map<String, Value>) {
+    let properties = input
+        .get_mut("properties")
+        .expect("derived properties exist");
+    if matches!(name, "prompt" | "follow" | "watch") {
+        properties["timeout"]["minimum"] = json!(MIN_SECONDS);
+        properties["timeout"]["maximum"] = json!(MAX_SECONDS);
+    }
+    if matches!(name, "follow" | "watch") {
+        properties["interval"]["minimum"] = json!(MIN_SECONDS);
+        properties["interval"]["maximum"] = json!(MAX_SECONDS);
+    }
+    if matches!(name, "prompt" | "steer" | "queue") {
+        properties["text"]["pattern"] = json!(NON_BLANK_TEXT_PATTERN);
+    }
+    if name == "prompt" {
+        input.insert("oneOf".into(), json!([
+            {"required": ["new"], "properties": {"new": {"const": true}, "session_id": {"type": "null"}}},
+            {"required": ["session_id"], "properties": {"new": {"const": false}, "session_id": {"type": "string"}}},
+        ]));
+    } else if name == "set_lifecycle" {
+        input.insert(
+            "anyOf".into(),
+            json!([
+                {"required": ["resolved"], "properties": {"resolved": {"type": "boolean"}}},
+                {"required": ["archived"], "properties": {"archived": {"type": "boolean"}}},
+            ]),
+        );
+    }
+}
+
+impl Command {
+    pub fn timeout(&self) -> Option<Duration> {
+        match self {
+            Self::Prompt { timeout, .. }
+            | Self::Follow { timeout, .. }
+            | Self::Watch { timeout, .. } => Some(Duration::from_secs(*timeout)),
+            _ => None,
+        }
+    }
+}
+
+pub async fn run(
+    client: &AcpClient,
+    command: Command,
+    state: &mut OperationState,
+    deadline: Option<tokio::time::Instant>,
+) -> Value {
+    let deadline = deadline.or_else(|| {
+        command
+            .timeout()
+            .map(|timeout| tokio::time::Instant::now() + timeout)
+    });
+    let is_batch = matches!(command, Command::Exec { .. });
+    state.recovery.clear();
+    let operation = async {
+        client.clear_assistant_text().await;
+        run_inner(client, command, state).await
+    };
+    let outcome = match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, operation)
+            .await
+            .unwrap_or_else(|_| Err(operation_timeout())),
+        None => operation.await,
+    };
+    let mut result = output::normalize(outcome.unwrap_or_else(output::failure));
+    let truncated = client.text_truncated().await
+        || (is_batch
+            && state
+                .batch
+                .as_ref()
+                .is_some_and(|batch| batch.text_truncated));
+    result["textTruncated"] = json!(truncated);
+    state.attach_recovery(result)
+}
+
+pub fn operation_timeout() -> CliError {
+    CliError::Timeout("operation timed out; the remote turn may still be running; inspect runtime before cancelling or retrying".into())
+}
+
+async fn run_inner(
+    client: &AcpClient,
+    command: Command,
+    state: &mut OperationState,
+) -> Result<Value, CliError> {
     let result = match command {
         Command::Caps {} => caps(client).await?,
         Command::Profiles {} => profiles(client).await?,
@@ -307,7 +468,7 @@ pub async fn run(client: &AcpClient, command: Command) -> Result<Value, CliError
             mode,
             model,
             effort,
-        } => new_session(client, cwd, profile, mode, model, effort).await?,
+        } => new_session(client, state, cwd, profile, mode, model, effort).await?,
         Command::Sessions {
             cwd,
             cursor,
@@ -382,7 +543,7 @@ pub async fn run(client: &AcpClient, command: Command) -> Result<Value, CliError
             mode,
             model,
             effort,
-            timeout,
+            timeout: _,
             delivery,
             until_idle,
         } => {
@@ -398,8 +559,7 @@ pub async fn run(client: &AcpClient, command: Command) -> Result<Value, CliError
                 delivery,
                 until_idle,
             };
-            tokio::time::timeout(Duration::from_secs(timeout), prompt(client, args)).await
-                .map_err(|_| CliError::Timeout(format!("prompt timed out after {timeout}s; the remote turn may still be running; inspect runtime before cancelling or retrying")))??
+            prompt(client, state, args).await?
         }
         Command::Runtime { session_id } => runtime(client, session_id).await?,
         Command::Follow {
@@ -407,48 +567,48 @@ pub async fn run(client: &AcpClient, command: Command) -> Result<Value, CliError
             cwd,
             interval,
             timeout,
-        } => tokio::time::timeout(
-            Duration::from_secs(timeout),
-            follow(client, session_id, cwd, interval, timeout),
-        )
-        .await
-        .map_err(|_| {
-            CliError::Timeout(format!(
-                "follow timed out after {timeout}s; the remote turn is not cancelled"
-            ))
-        })??,
+        } => follow(client, session_id, cwd, interval, timeout).await?,
         Command::Watch {
             session_id,
             interval,
             timeout,
             idle,
-        } => tokio::time::timeout(
-            Duration::from_secs(timeout),
-            watch(client, session_id, interval, timeout, idle),
-        )
-        .await
-        .map_err(|_| {
-            CliError::Timeout(format!(
-                "watch timed out after {timeout}s; the remote turn is not cancelled"
-            ))
-        })??,
+        } => watch(client, session_id, interval, timeout, idle).await?,
         Command::Steer {
             session_id,
             run_id,
             text,
-        } => submit_input(client, "querymt/session/steer", session_id, run_id, text).await?,
+        } => {
+            submit_input(
+                client,
+                state,
+                "querymt/session/steer",
+                session_id,
+                run_id,
+                text,
+            )
+            .await?
+        }
         Command::Queue { session_id, text } => {
-            submit_input(client, "querymt/session/queue", session_id, None, text).await?
+            submit_input(
+                client,
+                state,
+                "querymt/session/queue",
+                session_id,
+                None,
+                text,
+            )
+            .await?
         }
         Command::DiscardQueued {
             session_id,
             input_id,
         } => discard_queued(client, session_id, input_id).await?,
-        Command::Exec { calls } => exec(client, calls).await?,
+        Command::Exec { calls } => exec(client, calls, state).await?,
         Command::Cancel { session_id } => cancel(client, session_id).await?,
         Command::Close { session_id } => close(client, session_id).await?,
     };
-    Ok(crate::output::ok(result))
+    Ok(result)
 }
 
 async fn caps(client: &AcpClient) -> Result<Value, CliError> {
@@ -515,6 +675,7 @@ async fn models(
 
 async fn new_session(
     client: &AcpClient,
+    state: &mut OperationState,
     cwd: Option<PathBuf>,
     profile: Option<String>,
     mode: Option<String>,
@@ -528,6 +689,7 @@ async fn new_session(
         .await
         .map_err(CliError::from_request)?;
     let session_id = created.session_id.to_string();
+    state.session(&session_id, &cwd, true);
     apply_config(client, &session_id, mode, model, effort).await?;
     let status = match open_session(client, session_id.clone(), cwd.clone()).await {
         Ok(opened) => opened.status,
@@ -634,39 +796,39 @@ async fn find(
     let mut matches = Vec::new();
     let mut next = None;
     let mut pages = 0usize;
-    loop {
-        pages += 1;
-        if pages > session::find_page_cap() {
-            break;
-        }
+    while pages < session::find_page_cap() {
         let page = client
             .list_sessions(cwd.clone(), next.clone(), filters.clone())
             .await
             .map_err(CliError::from_request)?;
-        for listed in page.sessions {
-            let summary = session::session_summary(&listed);
+        pages += 1;
+        let mut listed = page.sessions.into_iter();
+        while let Some(item) = listed.next() {
+            let summary = session::session_summary(&item);
             if session::matches_query_and_phase(&summary, &query, phase.as_deref()) {
                 matches.push(summary);
                 if matches.len() >= limit {
+                    let page_consumed = listed.len() == 0;
+                    // A page cursor cannot represent a position inside the page.
+                    let truncated = !page_consumed || page.next_cursor.is_some();
                     return Ok(json!({
-                        "query": query,
-                        "phase": phase,
-                        "cwd": cwd,
-                        "sessions": matches,
+                        "query": query, "phase": phase, "cwd": cwd, "sessions": matches,
+                        "scannedPages": pages, "scanLimitReached": false, "truncated": truncated,
+                        "nextCursor": if page_consumed { page.next_cursor } else { None },
                     }));
                 }
             }
         }
-        match page.next_cursor {
-            Some(cursor) => next = Some(cursor),
-            None => break,
+        next = page.next_cursor;
+        if next.is_none() {
+            break;
         }
     }
+    let scan_limit_reached = next.is_some();
     Ok(json!({
-        "query": query,
-        "phase": phase,
-        "cwd": cwd,
-        "sessions": matches,
+        "query": query, "phase": phase, "cwd": cwd, "sessions": matches,
+        "scannedPages": pages, "scanLimitReached": scan_limit_reached,
+        "truncated": scan_limit_reached, "nextCursor": next,
     }))
 }
 
@@ -949,7 +1111,11 @@ struct PromptArgs {
     until_idle: bool,
 }
 
-async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<Value, CliError> {
+async fn prompt(
+    client: &AcpClient,
+    state: &mut OperationState,
+    args: PromptArgs,
+) -> Result<Value, CliError> {
     let PromptArgs {
         new,
         session_id,
@@ -969,10 +1135,13 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<Value, CliError>
             .new_session(cwd.clone(), profile.as_deref())
             .await
             .map_err(CliError::from_request)?;
-        created.session_id.to_string()
+        let session_id = created.session_id.to_string();
+        state.session(&session_id, &cwd, true);
+        session_id
     } else {
         let session_id = session_id
             .ok_or_else(|| CliError::Usage("prompt requires session_id or new=true".into()))?;
+        state.session(&session_id, &cwd, false);
         open_session(client, session_id.clone(), cwd.clone()).await?;
         session_id
     };
@@ -1002,7 +1171,8 @@ async fn prompt(client: &AcpClient, args: PromptArgs) -> Result<Value, CliError>
             } else {
                 "querymt/session/queue"
             };
-            submitted = Some(submit_input(client, method, session_id.clone(), None, text).await?);
+            submitted =
+                Some(submit_input(client, state, method, session_id.clone(), None, text).await?);
             if chosen == Delivery::Steer {
                 "steered".to_string()
             } else {
@@ -1176,6 +1346,7 @@ async fn watch(
 
 async fn submit_input(
     client: &AcpClient,
+    state: &mut OperationState,
     method: &str,
     session_id: String,
     run_id: Option<String>,
@@ -1192,6 +1363,15 @@ async fn submit_input(
         run_id
     };
     let client_input_id = uuid::Uuid::new_v4().to_string();
+    state.submission_started(
+        &session_id,
+        &client_input_id,
+        if method.ends_with("/steer") {
+            "steer"
+        } else {
+            "queue"
+        },
+    );
     let mut params = json!({
         "session_id": session_id,
         "client_input_id": client_input_id,
@@ -1207,33 +1387,49 @@ async fn submit_input(
         .extension(method, params)
         .await
         .map_err(CliError::from_request)?;
+    let acknowledgement = extension_payload(&response);
+    state.submission_acknowledged(&acknowledgement);
     Ok(json!({
         "sessionId": session_id,
         "clientInputId": client_input_id,
-        "result": extension_payload(&response),
+        "result": acknowledgement,
     }))
 }
 
-async fn exec(client: &AcpClient, calls: Vec<BatchCall>) -> Result<Value, CliError> {
-    let mut results = Vec::with_capacity(calls.len());
+async fn exec(
+    client: &AcpClient,
+    calls: Vec<BatchCall>,
+    state: &mut OperationState,
+) -> Result<Value, CliError> {
+    state.batch = Some(BatchState::default());
     for call in calls {
+        state.batch.as_mut().expect("batch initialized").active_call = Some(call.name.clone());
         let command = decode(&call.name, call.arguments).map_err(CliError::rpc)?;
-        match Box::pin(run(client, command)).await {
-            Ok(result) => {
-                let failed = result.get("stopReason").and_then(Value::as_str) == Some("cancelled");
-                results.push(json!({ "name": call.name, "result": result }));
-                if failed {
-                    return Ok(json!({ "results": results, "stopReason": "cancelled" }));
-                }
-            }
-            Err(error) => {
+        let result = Box::pin(run(client, command, state, None)).await;
+        let batch = state.batch.as_mut().expect("batch initialized");
+        batch.text_truncated |= result["textTruncated"] == true;
+        if output::failed(&result) {
+            if result.get("stopReason").and_then(Value::as_str) == Some("cancelled") {
+                batch
+                    .results
+                    .push(json!({ "name": call.name, "result": result }));
                 return Ok(
-                    json!({ "results": results, "failedCall": call.name, "error": error.to_string(), "code": error.exit_code().as_i32() }),
+                    json!({ "results": batch.results, "failedCall": call.name, "stopReason": "cancelled" }),
                 );
             }
+            return Ok(json!({
+                "results": batch.results, "failedCall": call.name,
+                "error": result.get("error"), "code": result.get("code"),
+                "failedResult": result,
+            }));
         }
+        batch
+            .results
+            .push(json!({ "name": call.name, "result": result }));
     }
-    Ok(json!({ "results": results }))
+    let batch = state.batch.as_mut().expect("batch initialized");
+    batch.active_call = None;
+    Ok(json!({ "results": batch.results }))
 }
 
 async fn discard_queued(
