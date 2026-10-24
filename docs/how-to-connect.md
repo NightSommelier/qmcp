@@ -136,6 +136,83 @@ per-user workspaces. Tokens are checked on every request without caching;
 provider outages deny access. Live ChatGPT sign-in depends on your provider
 configuration and has not been verified by the project's mock-provider tests.
 
+### Separate Nginx server to a Mac over VPN
+
+Topology: ChatGPT -> Nginx (public HTTPS) -> Mac (private/VPN HTTP) ->
+local QueryMT.
+This is a template, not a working ChatGPT connection yet: an external OAuth
+provider is still required, and none is configured for this deployment. TLS and
+proxying alone do not enable ChatGPT authentication; a static bearer is not a
+substitute. An arbitrary OIDC provider may lack the introspection endpoint or
+required claims described above.
+
+Replace every `mcp.example.com` with your public domain and every `10.0.0.42`
+with the Mac's actual private/VPN IP; both are placeholders. Point public DNS to
+Nginx, not the Mac, and use a valid TLS certificate for that domain on Nginx.
+
+On the Mac, keep QueryMT on `ws://127.0.0.1:3030/acp/ws` as described above.
+Prepare `oauth.json` using the provider's actual settings and set `resource` to
+`https://mcp.example.com/mcp` (with your domain). Inject the provider-issued
+introspection secret as `QMCP_OAUTH_CLIENT_SECRET` through protected service
+secret settings. Do not put it in JSON, command arguments, shell history, logs,
+or version control; do not print the environment. Leave `QMCP_BEARER_TOKEN`
+unset. Once the provider and secret are configured, run on the Mac:
+
+```sh
+qmcp --transport http --bind 10.0.0.42:3031 \
+  --allowed-host mcp.example.com --oauth-config /absolute/path/to/oauth.json
+```
+
+`--bind` takes an IP:port socket address, not a URL or hostname. This binds only
+the Mac's VPN/private interface; OAuth is required for this non-loopback bind.
+Use the installed qmcp binary's absolute path if it is not on `PATH`.
+
+On the separate Nginx host, adapt this HTTPS server template; certificate paths
+are placeholders too. Keep the upstream without a URI suffix so all three paths
+and their query strings reach qmcp unchanged:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name mcp.example.com;
+    ssl_certificate /path/to/fullchain.pem;
+    ssl_certificate_key /path/to/privkey.pem;
+
+    location ~ ^/(mcp|\.well-known/oauth-protected-resource(/mcp)?)$ {
+        proxy_pass http://10.0.0.42:3031;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header Authorization $http_authorization;
+        proxy_set_header Connection "";
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
+    location / { return 404; }
+}
+```
+
+The Host must match `--allowed-host`; do not replace it with the upstream IP.
+Forward Authorization unchanged; allow token-free discovery and preserve
+qmcp's `WWW-Authenticate` responses. Do not strip Origin to bypass qmcp's
+checks.
+Buffering/cache are disabled for Streamable HTTP; the example timeouts are
+inactivity limits, not a guarantee of task duration. Align any other proxy or
+load-balancer timeouts with long-lived requests.
+
+Allow inbound TCP 3031 on the Mac only from the Nginx host's VPN source IP,
+over the VPN interface; deny other sources. Do not publish/port-forward 3031 or
+expose QueryMT's ACP port. Plain HTTP here assumes the proxy-to-Mac hop uses the
+encrypted VPN, not an untrusted LAN. Verify Nginx can route to that Mac address;
+keep the VPN connected, the Mac awake/reachable, and QueryMT and qmcp running.
+Validate the adapted Nginx configuration with `nginx -t` before deploying it.
+After deployment, both discovery paths should return metadata without a token,
+and `/mcp` should reject missing/invalid tokens. Only then follow the OAuth
+ChatGPT setup above using `https://mcp.example.com/mcp`, not the private IP.
+
 ## Remote Access Checklist
 
 - Use HTTPS: qmcp itself does not terminate TLS. Never send tokens over public plaintext HTTP.
