@@ -20,10 +20,26 @@ cargo install --locked --path .
 
 ## Connect
 
+For a single-owner ChatGPT connection on macOS, qmcp includes OAuth login,
+consent, public-client registration and PKCE. No external provider or Docker
+service is required. Use an HTTPS reverse proxy and a generated owner credential
+in a private `0600` file:
 
-See [How to connect](docs/how-to-connect.md) for local stdio, Bearer over HTTPS,
-private tunnels, and OAuth/ChatGPT setup. The guide includes client examples,
-authentication requirements, and remote-access precautions.
+```sh
+qmcp --transport http --permission cancel \
+  --oauth-local-resource https://mcp.example.com/mcp \
+  --oauth-owner-secret-file /absolute/private/path/to/owner-secret
+```
+
+These are example values, not a deployment configuration. See
+[How to connect](docs/how-to-connect.md#embedded-oauth-on-macos-chatgpt) for secret
+generation, proxy setup and ChatGPT sign-in. Embedded OAuth is single-owner and
+volatile: restarting invalidates tokens **and registered client IDs**, so you may
+need to re-add the server in ChatGPT. Registrations also expire after one hour;
+tokens last 30 minutes, with no refresh tokens.
+
+Local stdio, static Bearer over HTTPS, private tunnels, and optional external
+OAuth introspection remain available in the [connection guide](docs/how-to-connect.md).
 
 ## Tools
 

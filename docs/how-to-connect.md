@@ -5,9 +5,10 @@
 | Setup | Best for | Authentication |
 | --- | --- | --- |
 | [Local stdio](#local-stdio) | Desktop and CLI MCP clients | Local process permissions |
+| [Embedded OAuth on macOS](#embedded-oauth-on-macos-chatgpt) | Single-owner public ChatGPT connections | Built-in owner login + consent; no external provider |
 | [Bearer over HTTPS](#bearer-over-https) | Clients with custom authorization headers | Shared token |
 | [Private tunnel](#private-tunnel-chatgpt) | ChatGPT without a public endpoint | OpenAI tunnel access |
-| [OAuth over HTTPS](#oauth-over-https-chatgpt) | Public authenticated ChatGPT connections | External OAuth provider |
+| [External OAuth provider](#external-oauth-provider-optional) | Deployments with an existing identity provider | Optional external introspection |
 
 Bearer and OAuth are HTTP authentication modes. The tunnel privately connects
 ChatGPT to qmcp over stdio; it is not another MCP transport.
@@ -92,9 +93,119 @@ to keep qmcp private. Your account/workspace must allow tunnels and custom MCP s
 4. Select the plugin with `@` in a chat and ask: **"Use qmcp to list QueryMT profiles."**
    Keep QueryMT and `tunnel-client` running. No public qmcp endpoint is needed.
 
-## OAuth over HTTPS (ChatGPT)
+## Embedded OAuth on macOS (ChatGPT)
 
-Use an external [OAuth provider](https://developers.openai.com/plugins/build/auth)
+qmcp includes a single-owner OAuth authorization server. No Docker, external
+identity provider, or separate login service is needed. Start QueryMT locally,
+then put qmcp behind a trusted HTTPS reverse proxy. qmcp does not terminate TLS.
+The resource must be a canonical HTTPS URL ending in exactly `/mcp`, without
+userinfo, query, or fragment. Its origin is the issuer (no trailing slash).
+
+### Generate the owner credential
+
+Generate a new secret, not a human-chosen password. This example creates a
+private file without printing its contents, and refuses to overwrite an existing
+file. Run it only when preparing a deployment, not as part of a source review:
+
+```sh
+umask 077
+mkdir -p "$HOME/.config/qmcp"
+chmod 700 "$HOME/.config/qmcp"
+(set -C; openssl rand -hex 32 > "$HOME/.config/qmcp/owner-secret")
+chmod 600 "$HOME/.config/qmcp/owner-secret"
+```
+
+Keep the generated value in a trusted password manager for browser login. Never
+put it in command arguments, URLs, environment variables, logs, source control,
+or a PR. qmcp never creates or prints an owner credential. It accepts 32..64
+random bytes encoded as 64..128 lowercase hex characters, optionally followed
+by a newline. Length/encoding and obvious-weakness checks cannot prove entropy;
+**only use a cryptographically generated secret**, not a phrase or password.
+The absolute file path must name a regular file owned by qmcp's user, mode
+`0600`, with no final-component symlink or hard links. Keep its parent directory
+private and free of untrusted symlinks/ACLs. Secret-file protection currently
+requires Unix (including macOS).
+
+### Run and connect
+
+Leave `QMCP_BEARER_TOKEN` and `QMCP_OAUTH_CLIENT_SECRET` unset, then run after
+reviewing your deployment configuration:
+
+```sh
+qmcp --transport http --permission cancel \
+  --oauth-local-resource https://mcp.example.com/mcp \
+  --oauth-owner-secret-file "$HOME/.config/qmcp/owner-secret"
+```
+
+The default bind is `127.0.0.1:3031`. For a proxy on another host, see the
+[Nginx/VPN example](#separate-nginx-server-to-a-mac-over-vpn). Embedded OAuth
+accepts only the canonical public resource Host, which is also added to MCP's
+Host allowlist; additional host aliases do not broaden that outer guard.
+Local OAuth, external OAuth (`--oauth-config`), and static Bearer are mutually
+exclusive. HTTP authentication options are rejected in stdio mode; an owner
+secret flag without a local resource is rejected too.
+
+Forward **all** these paths through the HTTPS proxy, preserving Host,
+Authorization, Origin, and query strings:
+
+- `/mcp`
+- `/.well-known/oauth-authorization-server`
+- `/.well-known/oauth-protected-resource` and its `/mcp` variant
+- `/oauth/register`, `/oauth/authorize`, `/oauth/token`
+
+In ChatGPT, add a custom MCP server with `https://mcp.example.com/mcp` and select
+**OAuth**. Use dynamic client registration (DCR); do not enter the owner secret
+as a client ID/secret. During sign-in, verify the public domain, the unverified
+client name, and its exact callback URL. Enter the generated owner secret on
+qmcp's **Owner login + authorize** page and explicitly choose **Log in and
+Approve**, or choose **Deny**. Registration alone grants no access. Workspace
+settings must allow custom MCP servers. The flow is covered by local tests;
+live ChatGPT interoperability still needs deployment validation.
+
+### Security and operational limits
+
+- Only public DCR clients, authorization-code grants, and PKCE `S256` are
+  supported. No implicit grant, refresh tokens, CIMD URL fetching, or client
+  secret authentication. Registration never fetches a supplied URL.
+- The exact registered redirect, public resource, client, and `qmcp:access`
+  scope are bound to authorization and code exchange. HTTPS callbacks are
+  required except literal loopback/localhost HTTP callbacks. Redirects with
+  fragments, credentials, or reserved OAuth response query fields are rejected.
+  Unknown registration metadata is rejected; up to eight redirects and a
+  128-byte client name are accepted within an 8 KiB request body.
+- Each five-minute browser transaction requires a random CSRF token and a
+  Secure, HttpOnly, SameSite=Lax, path-scoped cookie. Form POSTs require the
+  exact issuer Origin. MCP and all other routes reject Origin; never strip it
+  at the proxy to bypass validation. Each submitted transaction has one owner
+  login attempt. There is no remembered login or silent approval.
+- Codes expire after 90 seconds and are consumed atomically, including on a
+  failed binding/PKCE check. Access tokens expire after 30 minutes. Only
+  SHA-256 digests of owner credentials, cookies, CSRF tokens, codes and access
+  tokens are retained in server state. Responses use no-store and restrictive
+  CSP, framing and referrer policies.
+- All state is **volatile**. Restart invalidates grants, tokens, transactions,
+  and DCR client IDs; ChatGPT may require removing and re-adding the server,
+  not just signing in again. Client registrations also expire after one hour;
+  their expiration may require re-registration/re-adding. There is no database,
+  registration management API, per-client revocation, or persistence.
+- Capacity is 128 clients, 128 browser transactions, 128 codes and 256 tokens.
+  Expired entries are pruned on use. Global fixed-memory limits per minute are
+  16 registrations, 60 authorizations, 8 login POSTs and 120 token requests.
+  AS bodies have an 8 KiB limit, 16 concurrent readers and a ten-second read
+  timeout. Limits deliberately do not trust client-IP/proxy headers. An attacker
+  can temporarily exhaust capacity/rate windows; put deployment-specific
+  connection/rate limits at the trusted proxy. No automatic eviction of live
+  grants is attempted.
+- This is a **single-owner backend**, not multi-user isolation. Approval grants
+  all tools on the connected QueryMT instance. `--permission cancel` controls
+  agent tool approval, not OAuth scope. Protect the owner secret accordingly.
+  For rotation or global revocation, replace the protected file and perform a
+  reviewed restart. Keep TLS termination, proxy logs (no query/body/header or
+  token-response logging for OAuth), firewall and the private upstream secure.
+
+## External OAuth Provider (Optional)
+
+For an existing identity provider, use an external [OAuth provider](https://developers.openai.com/plugins/build/auth)
 with authorization-code + PKCE (`S256`) and ChatGPT client registration
 (pre-registered, CIMD, or DCR). qmcp provides discovery and token introspection;
 the provider handles login, consent, token issuance, and revocation.
@@ -136,31 +247,30 @@ per-user workspaces. Tokens are checked on every request without caching;
 provider outages deny access. Live ChatGPT sign-in depends on your provider
 configuration and has not been verified by the project's mock-provider tests.
 
-### Separate Nginx server to a Mac over VPN
+## Separate Nginx server to a Mac over VPN
 
 Topology: ChatGPT -> Nginx (public HTTPS) -> Mac (private/VPN HTTP) ->
 local QueryMT.
-This is a template, not a working ChatGPT connection yet: an external OAuth
-provider is still required, and none is configured for this deployment. TLS and
+This is a deployment template, not a claim of a verified live connection.
+Use embedded OAuth on the Mac; an external provider is optional. TLS and
 proxying alone do not enable ChatGPT authentication; a static bearer is not a
-substitute. An arbitrary OIDC provider may lack the introspection endpoint or
-required claims described above.
+substitute. If you choose external OAuth instead, an arbitrary OIDC provider
+may lack the introspection endpoint or claims described in the optional section.
 
 Replace every `mcp.example.com` with your public domain and every `10.0.0.42`
 with the Mac's actual private/VPN IP; both are placeholders. Point public DNS to
 Nginx, not the Mac, and use a valid TLS certificate for that domain on Nginx.
 
 On the Mac, keep QueryMT on `ws://127.0.0.1:3030/acp/ws` as described above.
-Prepare `oauth.json` using the provider's actual settings and set `resource` to
-`https://mcp.example.com/mcp` (with your domain). Inject the provider-issued
-introspection secret as `QMCP_OAUTH_CLIENT_SECRET` through protected service
-secret settings. Do not put it in JSON, command arguments, shell history, logs,
-or version control; do not print the environment. Leave `QMCP_BEARER_TOKEN`
-unset. Once the provider and secret are configured, run on the Mac:
+Generate the protected owner secret as described above. Leave
+`QMCP_BEARER_TOKEN` and `QMCP_OAUTH_CLIENT_SECRET` unset. After reviewing the
+configuration, run on the Mac (all addresses and paths here are examples):
 
 ```sh
 qmcp --transport http --bind 10.0.0.42:3031 \
-  --allowed-host mcp.example.com --oauth-config /absolute/path/to/oauth.json
+  --allowed-host mcp.example.com --permission cancel \
+  --oauth-local-resource https://mcp.example.com/mcp \
+  --oauth-owner-secret-file /absolute/private/path/to/owner-secret
 ```
 
 `--bind` takes an IP:port socket address, not a URL or hostname. This binds only
@@ -168,8 +278,8 @@ the Mac's VPN/private interface; OAuth is required for this non-loopback bind.
 Use the installed qmcp binary's absolute path if it is not on `PATH`.
 
 On the separate Nginx host, adapt this HTTPS server template; certificate paths
-are placeholders too. Keep the upstream without a URI suffix so all three paths
-and their query strings reach qmcp unchanged:
+are placeholders too. Keep the upstream without a URI suffix so MCP, discovery,
+and all embedded authorization-server endpoints and queries reach qmcp unchanged:
 
 ```nginx
 server {
@@ -178,11 +288,13 @@ server {
     ssl_certificate /path/to/fullchain.pem;
     ssl_certificate_key /path/to/privkey.pem;
 
-    location ~ ^/(mcp|\.well-known/oauth-protected-resource(/mcp)?)$ {
+    location / {
         proxy_pass http://10.0.0.42:3031;
         proxy_http_version 1.1;
-        proxy_set_header Host $host;
+        proxy_set_header Host $http_host;
         proxy_set_header Authorization $http_authorization;
+        proxy_set_header Origin $http_origin;
+        access_log off; # OAuth queries contain authorization codes/state.
         proxy_set_header Connection "";
         proxy_buffering off;
         proxy_request_buffering off;
@@ -191,7 +303,6 @@ server {
         proxy_send_timeout 3600s;
     }
 
-    location / { return 404; }
 }
 ```
 
@@ -209,17 +320,22 @@ expose QueryMT's ACP port. Plain HTTP here assumes the proxy-to-Mac hop uses the
 encrypted VPN, not an untrusted LAN. Verify Nginx can route to that Mac address;
 keep the VPN connected, the Mac awake/reachable, and QueryMT and qmcp running.
 Validate the adapted Nginx configuration with `nginx -t` before deploying it.
-After deployment, both discovery paths should return metadata without a token,
-and `/mcp` should reject missing/invalid tokens. Only then follow the OAuth
-ChatGPT setup above using `https://mcp.example.com/mcp`, not the private IP.
+After deployment, the AS metadata and both resource-discovery paths should
+return metadata without a token, and `/mcp` should reject missing/invalid tokens.
+Only then follow the embedded OAuth ChatGPT setup above using
+`https://mcp.example.com/mcp`, not the private IP. Deployment and real sign-in
+verification are separate from source/build review; do not restart a live
+service merely to run tests.
 
 ## Remote Access Checklist
 
 - Use HTTPS: qmcp itself does not terminate TLS. Never send tokens over public plaintext HTTP.
 - Keep qmcp's backend port private to the proxy with a firewall/private network.
-- Forward Authorization and an allowed Host. Browser Origin headers are rejected.
-- Non-loopback binds require Bearer or OAuth auth. Wildcard binds also require
-  explicit `--allowed-host` values (repeatable, optionally `host:port`).
+- Forward Authorization, Host and Origin unchanged. MCP rejects browser Origin;
+  only embedded OAuth consent POSTs accept the exact public issuer Origin.
+- Non-loopback binds require Bearer or OAuth auth. Wildcard binds require an
+  explicit Host allowlist (`--allowed-host`, repeatable, optionally `host:port`);
+  embedded OAuth supplies its canonical resource Host automatically.
 - Use `--bind` only when the proxy needs another interface. Keep the default
   loopback listener when the proxy runs on the same host.
 - `--permission` controls QueryMT tool approval, not MCP client authentication.
