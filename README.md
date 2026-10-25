@@ -59,6 +59,10 @@ return provider data under `result`, separate from bridge status and event metad
   notifications; disconnecting is not a guarantee that the operation stopped.
 - Failed calls may include `recovery` details. Check them and current runtime
   before retrying: prior effects are not rolled back, including in `exec` batches.
+- Queue/steer delivery skips session history. On `prompt`, `until_idle: false`
+  returns after submission when either is selected; idle prompt delivery still waits.
+- A receipt confirms acceptance, not task success. Check `observationState`;
+  invalid receipts fail and keep submission recovery unconfirmed.
 - Events and assistant text are returned with the result, not streamed live.
   Check `droppedEvents` and `textTruncated` for incomplete output.
 - `find` scans at most 20 pages. Check `truncated` and `scanLimitReached` before

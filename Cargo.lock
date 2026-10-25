@@ -1857,8 +1857,8 @@ dependencies = [
 
 [[package]]
 name = "qmacp"
-version = "0.1.1"
-source = "git+https://github.com/querymt/qmacp?tag=v0.1.1#5a8371446f49a559b57f106b2ca22c8d0fc75463"
+version = "0.1.2"
+source = "git+https://github.com/querymt/qmacp?tag=v0.1.2#7b019b104017b7f30926c8ce18689b7aa8d142b8"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -1876,7 +1876,7 @@ dependencies = [
 
 [[package]]
 name = "qmcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",

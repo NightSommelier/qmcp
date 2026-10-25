@@ -34,6 +34,9 @@ enum SubmissionBehavior {
     PollError,
     Busy,
     NoReply,
+    HistoryUnavailable,
+    MissingReceiptStatus,
+    WrongReceiptId,
 }
 
 impl MockAcp {
@@ -168,6 +171,7 @@ async fn serve_acp(
                 | "_querymt/session/getLifecycle"
                 | "_querymt/session/setLifecycle"
                 | "_querymt/session/setPinned"
+                | "_querymt/session/runtimeState"
         ) && let Some(payload) = &extension_payload
         {
             send(
@@ -187,6 +191,10 @@ async fn serve_acp(
             "_querymt/profiles" => json!({"profiles": [{"id": "fixture-profile"}]}),
             "session/new" => json!({"sessionId": "fixture-session"}),
             "session/resume" | "session/load" => {
+                if matches!(behavior, SubmissionBehavior::HistoryUnavailable) {
+                    send(&mut socket, json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32000, "message": "history replay unavailable"}})).await;
+                    continue;
+                }
                 json!({"configOptions": [{"id": "model", "name": "Model", "type": "select", "currentValue": "fixture-model", "options": [{"value": "fixture-model", "name": "Fixture"}]}]})
             }
             "session/list" => {
@@ -231,7 +239,19 @@ async fn serve_acp(
                 if matches!(behavior, SubmissionBehavior::NoReply) {
                     continue;
                 }
-                json!({"accepted": true})
+                let input_id = &params["client_input_id"];
+                match behavior {
+                    SubmissionBehavior::MissingReceiptStatus => {
+                        json!({"data": {"input_id": input_id}})
+                    }
+                    SubmissionBehavior::WrongReceiptId => {
+                        json!({"status": "queued", "data": {"input_id": "wrong-input"}})
+                    }
+                    _ => json!({
+                        "status": if method.ends_with("/steer") { "steered" } else { "queued" },
+                        "data": {"input_id": input_id, "run_id": "fixture-run", "position": 1},
+                    }),
+                }
             }
             "_querymt/session/discardQueuedInput" => json!({"accepted": true}),
             "session/set_mode" if params["modeId"] == "flood-config" => {
@@ -446,6 +466,7 @@ async fn exercise_bridge(http: bool) {
     assert_eq!(prompt["isError"], false, "{prompt}");
     assert_eq!(prompt["structuredContent"]["sessionId"], "fixture-session");
     assert_eq!(prompt["structuredContent"]["text"], "reply:-");
+    assert_eq!(prompt["structuredContent"]["observationState"], "idle");
     assert!(
         prompt["structuredContent"]["events"]
             .as_array()
@@ -456,10 +477,14 @@ async fn exercise_bridge(http: bool) {
     let continued = mcp
         .tool(
             "prompt",
-            json!({"session_id": "fixture-session", "cwd": cwd, "text": "continue"}),
+            json!({"session_id": "fixture-session", "cwd": cwd, "text": "continue", "until_idle": false}),
         )
         .await;
     assert_eq!(continued["structuredContent"]["text"], "reply:continue");
+    assert_eq!(
+        continued["structuredContent"]["observationState"],
+        "prompt_returned"
+    );
 
     let listed = mcp
         .tool(
@@ -505,6 +530,7 @@ async fn exercise_bridge(http: bool) {
             .as_str()
             .is_some()
     );
+    assert_eq!(queued["structuredContent"]["deliveryState"], "accepted");
     let cancelled = mcp
         .tool("cancel", json!({"session_id": "fixture-session"}))
         .await;
@@ -707,12 +733,126 @@ async fn submission_identity_survives_poll_failures_and_timeouts_without_input_e
                     assert!(submission.get("acknowledgement").is_none());
                 } else {
                     assert_eq!(submission["state"], "acknowledged");
-                    assert_eq!(submission["acknowledgement"]["accepted"], true);
+                    assert_eq!(
+                        submission["acknowledgement"]["input_id"],
+                        submission["clientInputId"]
+                    );
                 }
+                assert!(requests.iter().all(|request| {
+                    !matches!(
+                        request["method"].as_str(),
+                        Some("session/load" | "session/resume")
+                    )
+                }));
                 backend.wait_disconnected().await;
                 assert_no_implicit_cancel(&backend);
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn nonwaiting_delivery_skips_unavailable_history_and_returns_the_receipt() {
+    for delivery in ["queue", "auto"] {
+        let backend = MockAcp::with_submission(SubmissionBehavior::HistoryUnavailable).await;
+        let mut mcp = Mcp::start(&backend.url, false).await;
+        let response = mcp
+            .tool(
+                "prompt",
+                json!({
+                    "session_id": "fixture-session", "text": "callback", "delivery": delivery,
+                    "until_idle": false,
+                }),
+            )
+            .await;
+        assert_eq!(response["isError"], false, "{response}");
+        let result = &response["structuredContent"];
+        assert_eq!(
+            result["delivery"],
+            if delivery == "auto" { "steer" } else { "queue" }
+        );
+        assert_eq!(result["observationState"], "not_waited");
+        assert_eq!(result["text"], "");
+        assert_eq!(result["submitted"]["deliveryState"], "accepted");
+        assert_eq!(
+            result["submitted"]["result"]["input_id"],
+            result["submitted"]["clientInputId"]
+        );
+        assert!(result["events"].as_array().unwrap().iter().any(|event| {
+            event["type"] == "submitted"
+                && event["clientInputId"] == result["submitted"]["clientInputId"]
+        }));
+        assert!(backend.recorded().iter().all(|request| {
+            !matches!(
+                request["method"].as_str(),
+                Some("session/load" | "session/resume" | "session/prompt")
+            )
+        }));
+    }
+}
+
+#[tokio::test]
+async fn invalid_receipts_stay_unconfirmed_and_stop_a_batch() {
+    for behavior in [
+        SubmissionBehavior::MissingReceiptStatus,
+        SubmissionBehavior::WrongReceiptId,
+    ] {
+        let backend = MockAcp::with_submission(behavior).await;
+        let mut mcp = Mcp::start(&backend.url, false).await;
+        let response = mcp.tool("exec", json!({"calls": [
+            {"name": "queue", "arguments": {"session_id": "fixture-session", "text": "callback"}},
+            {"name": "close", "arguments": {"session_id": "fixture-session"}},
+        ]})).await;
+        assert_eq!(response["isError"], true, "{response}");
+        let result = &response["structuredContent"];
+        assert_eq!(result["failedCall"], "queue");
+        assert_eq!(result["recovery"]["submission"]["state"], "unconfirmed");
+        assert!(
+            result["recovery"]["submission"]
+                .get("acknowledgement")
+                .is_none()
+        );
+        assert!(
+            !result["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["type"] == "submitted")
+        );
+        let requests = backend.recorded();
+        let sent = requests
+            .iter()
+            .find(|request| request["method"] == "_querymt/session/queue")
+            .unwrap();
+        assert_eq!(
+            result["recovery"]["submission"]["clientInputId"],
+            sent["params"]["client_input_id"]
+        );
+        assert_no_implicit_cancel(&backend);
+    }
+}
+
+#[tokio::test]
+async fn invalid_runtime_and_missing_active_run_never_submit_work() {
+    for (tool, runtime) in [
+        ("prompt", json!({})),
+        ("prompt", json!({"phase": "tools"})),
+        ("steer", json!({"phase": "idle", "steerable": false})),
+    ] {
+        let backend = MockAcp::with_extension_payload(runtime).await;
+        let mut mcp = Mcp::start(&backend.url, false).await;
+        let response = mcp
+            .tool(
+                tool,
+                json!({"session_id": "fixture-session", "text": "callback"}),
+            )
+            .await;
+        assert_eq!(response["isError"], true, "{response}");
+        assert_eq!(response["structuredContent"]["code"], 3);
+        assert!(backend.recorded().iter().all(|request| matches!(
+            request["method"].as_str(),
+            Some("initialize" | "_querymt/session/runtimeState")
+        )));
     }
 }
 
