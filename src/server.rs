@@ -283,7 +283,7 @@ mod tests {
                     }
                     "_querymt/session/queue" => {
                         input_id = request["params"]["client_input_id"].clone();
-                        json!({"accepted": true})
+                        json!({"status": "queued", "data": {"input_id": input_id, "position": 1}})
                     }
                     "session/cancel" | "session/close" => {
                         panic!("MCP cancellation must not cancel or close remote work")
@@ -323,16 +323,17 @@ mod tests {
         assert_eq!(result["results"].as_array().unwrap().len(), 1);
         assert_eq!(result["results"][0]["result"]["ok"], true);
         assert_eq!(result["recovery"]["submission"]["state"], "acknowledged");
-        assert_eq!(
-            result["recovery"]["submission"]["acknowledgement"]["accepted"],
-            true
-        );
+        assert_eq!(result["recovery"]["deliveryState"], "accepted");
         let input_id = tokio::time::timeout(Duration::from_secs(1), peer)
             .await
             .expect("the cancelled call must drop its ACP client")
             .unwrap();
         assert!(input_id.is_string());
         assert_eq!(result["recovery"]["submission"]["clientInputId"], input_id);
+        assert_eq!(
+            result["recovery"]["submission"]["acknowledgement"]["input_id"],
+            input_id
+        );
     }
 
     #[test]

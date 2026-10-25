@@ -82,6 +82,8 @@ impl OperationState {
 
     pub fn submission_started(&mut self, session_id: &str, input_id: &str, delivery: &str) {
         self.recovery.insert("sessionId".into(), json!(session_id));
+        self.recovery
+            .insert("deliveryState".into(), json!("unknown"));
         self.recovery.insert(
             "submission".into(),
             json!({
@@ -91,6 +93,8 @@ impl OperationState {
     }
 
     pub fn submission_acknowledged(&mut self, result: &Value) {
+        self.recovery
+            .insert("deliveryState".into(), json!("accepted"));
         let submission = self
             .recovery
             .get_mut("submission")
