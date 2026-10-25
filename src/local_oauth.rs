@@ -32,10 +32,22 @@ const CLIENT_TTL: Duration = Duration::from_secs(3600);
 const TRANSACTION_TTL: Duration = Duration::from_secs(300);
 const CODE_TTL: Duration = Duration::from_secs(90);
 const TOKEN_TTL: Duration = Duration::from_secs(1800);
+const FAMILY_TTL: Duration = Duration::from_secs(24 * 3600);
+const MAX_FAMILIES: usize = 128;
+const MAX_CLIENT_FAMILIES: usize = 8;
+const MAX_REFRESH_RECORDS: usize = 8192;
+const MAX_FAMILY_RECORDS: usize = 128;
 const MAX_CLIENTS: usize = 128;
 const MAX_TRANSACTIONS: usize = 128;
 const MAX_CODES: usize = 128;
 const MAX_TOKENS: usize = 256;
+const MAX_UNAPPROVED_CLIENTS: usize = 96;
+const MAX_CLIENT_TRANSACTIONS: usize = 8;
+const MAX_CLIENT_CODES: usize = 8;
+const MAX_CLIENT_TOKENS: usize = 16;
+const AGGREGATE_RATE: usize = 4096;
+const REGISTRATION_RATE: usize = 1024;
+const MAX_REGISTRATION_ORIGINS: usize = 256;
 const MAX_BODY: usize = 8192;
 const COOKIE: &str = "__Secure-qmcp_oauth";
 type Digest32 = [u8; 32];
@@ -60,16 +72,23 @@ struct Store {
     transactions: HashMap<Digest32, Transaction>,
     codes: HashMap<Digest32, Code>,
     tokens: HashMap<Digest32, Token>,
+    families: HashMap<Digest32, Family>,
+    refresh: HashMap<Digest32, RefreshRecord>,
     registration_rate: Rate,
     authorization_rate: Rate,
-    login_rate: Rate,
     exchange_rate: Rate,
+    registration_origins: HashMap<String, Rate>,
 }
 
 struct Client {
     redirects: Vec<String>,
     name: String,
     expires: Instant,
+    approved: bool,
+    refresh_allowed: bool,
+    authorization_rate: Rate,
+    login_rate: Rate,
+    exchange_rate: Rate,
 }
 
 struct Grant {
@@ -92,14 +111,29 @@ struct Code {
     expires: Instant,
 }
 
+struct Family {
+    client: String,
+    resource: String,
+    scope: String,
+    expires: Instant,
+    records: usize,
+    revoked: bool,
+}
+
+struct RefreshRecord {
+    family: Digest32,
+    consumed: bool,
+}
+
 struct Token {
+    family: Option<Digest32>,
     client: String,
     resource: String,
     scope: String,
     expires: Instant,
 }
 
-/// Global fixed-memory windows deliberately ignore spoofable proxy/IP headers.
+/// Fixed-memory windows deliberately ignore spoofable proxy/IP headers.
 #[derive(Default)]
 struct Rate {
     start: Option<Instant>,
@@ -125,10 +159,45 @@ impl Rate {
 
 impl Store {
     fn prune(&mut self, now: Instant) {
-        self.clients.retain(|_, c| c.expires > now);
+        self.clients.retain(|_, c| c.approved || c.expires > now);
+        self.registration_origins.retain(|_, rate| {
+            rate.start
+                .is_some_and(|start| now.duration_since(start) < Duration::from_secs(60))
+        });
         self.transactions.retain(|_, t| t.expires > now);
         self.codes.retain(|_, c| c.expires > now);
-        self.tokens.retain(|_, t| t.expires > now);
+        self.families.retain(|_, family| family.expires > now);
+        self.refresh
+            .retain(|_, record| self.families.contains_key(&record.family));
+        self.tokens.retain(|_, t| {
+            t.expires > now
+                && t.family
+                    .is_none_or(|id| self.families.get(&id).is_some_and(|family| !family.revoked))
+        });
+    }
+
+    fn access_capacity(&self, client: &str) -> bool {
+        self.tokens.len() < MAX_TOKENS
+            && self.tokens.values().filter(|t| t.client == client).count() < MAX_CLIENT_TOKENS
+    }
+
+    fn family_capacity(&self, client: &str) -> bool {
+        self.families.len() < MAX_FAMILIES
+            && self
+                .families
+                .values()
+                .filter(|f| f.client == client)
+                .count()
+                < MAX_CLIENT_FAMILIES
+            && self.refresh.len() < MAX_REFRESH_RECORDS
+    }
+
+    fn revoke_family(&mut self, id: Digest32) {
+        if let Some(family) = self.families.get_mut(&id) {
+            family.revoked = true;
+        }
+        self.tokens.retain(|_, token| token.family != Some(id));
+        // Keep all refresh digests, including the active one, until absolute expiry.
     }
 }
 
@@ -241,7 +310,9 @@ impl LocalOAuth {
     }
 
     pub(crate) fn guard(&self, router: Router) -> Router {
-        router.layer(middleware::from_fn_with_state(self.clone(), guard))
+        router
+            .layer(middleware::from_fn_with_state(self.clone(), guard))
+            .layer(middleware::from_fn(diagnostics))
     }
 
     fn accepts(&self, credential: &str) -> bool {
@@ -256,6 +327,132 @@ impl LocalOAuth {
 
 fn digest(value: &str) -> Digest32 {
     Sha256::digest(value.as_bytes()).into()
+}
+
+// Only fixed classifications cross into diagnostics; never request data or errors.
+#[derive(Clone, Copy)]
+struct DiagnosticError(&'static str);
+
+fn diagnostic_error(value: &str) -> DiagnosticError {
+    DiagnosticError(match value {
+        "access_denied" => "access_denied",
+        "invalid_request" => "invalid_request",
+        "invalid_token" => "invalid_token",
+        "invalid_client" => "invalid_client",
+        "invalid_client_metadata" => "invalid_client_metadata",
+        "invalid_grant" => "invalid_grant",
+        "invalid_target" => "invalid_target",
+        "invalid_scope" => "invalid_scope",
+        "unsupported_response_type" => "unsupported_response_type",
+        "unsupported_grant_type" => "unsupported_grant_type",
+        "slow_down" => "slow_down",
+        "temporarily_unavailable" => "temporarily_unavailable",
+        _ => "other",
+    })
+}
+
+#[derive(Clone, Copy)]
+enum DiagnosticReason {
+    HostRejected,
+    OriginRejected,
+    PostQuery,
+    UriTooLong,
+    InvalidJson,
+    InvalidRedirect,
+    InvalidClientName,
+    UnsupportedAuthMethod,
+    UnsupportedGrant,
+    UnsupportedResponse,
+    UnsupportedScope,
+    RegistrationRate,
+    OriginRate,
+    OriginCapacity,
+    ClientCapacity,
+    BodyRejected,
+    RandomUnavailable,
+    Registered,
+}
+
+impl DiagnosticReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::HostRejected => "host_rejected",
+            Self::OriginRejected => "origin_rejected",
+            Self::PostQuery => "post_query",
+            Self::UriTooLong => "uri_too_long",
+            Self::InvalidJson => "invalid_json",
+            Self::InvalidRedirect => "invalid_redirect",
+            Self::InvalidClientName => "invalid_client_name",
+            Self::UnsupportedAuthMethod => "unsupported_auth_method",
+            Self::UnsupportedGrant => "unsupported_grant",
+            Self::UnsupportedResponse => "unsupported_response",
+            Self::UnsupportedScope => "unsupported_scope",
+            Self::RegistrationRate => "registration_rate",
+            Self::OriginRate => "origin_rate",
+            Self::OriginCapacity => "origin_capacity",
+            Self::ClientCapacity => "client_capacity",
+            Self::BodyRejected => "body_rejected",
+            Self::RandomUnavailable => "random_unavailable",
+            Self::Registered => "registered",
+        }
+    }
+
+    fn attach(self, mut response: Response) -> Response {
+        response.extensions_mut().insert(self);
+        response
+    }
+}
+
+fn diagnostic_route(path: &str) -> &'static str {
+    match path {
+        "/mcp" => "/mcp",
+        "/.well-known/oauth-protected-resource" => "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/mcp" => "/.well-known/oauth-protected-resource/mcp",
+        "/.well-known/oauth-authorization-server" => "/.well-known/oauth-authorization-server",
+        "/oauth/register" => "/oauth/register",
+        "/oauth/authorize" => "/oauth/authorize",
+        "/oauth/token" => "/oauth/token",
+        _ => "/other",
+    }
+}
+
+fn diagnostic_method(method: &Method) -> &'static str {
+    match *method {
+        Method::GET => "GET",
+        Method::HEAD => "HEAD",
+        Method::POST => "POST",
+        Method::PUT => "PUT",
+        Method::PATCH => "PATCH",
+        Method::DELETE => "DELETE",
+        Method::OPTIONS => "OPTIONS",
+        Method::CONNECT => "CONNECT",
+        Method::TRACE => "TRACE",
+        _ => "OTHER",
+    }
+}
+
+async fn diagnostics(request: Request, next: Next) -> Response {
+    let route = diagnostic_route(request.uri().path());
+    let method = diagnostic_method(request.method());
+    let response = next.run(request).await;
+    let error = response.extensions().get::<DiagnosticError>();
+    let reason = response.extensions().get::<DiagnosticReason>();
+    let registration = response.extensions().get::<RegistrationDiagnostic>();
+    tracing::info!(
+        target: "qmcp::oauth_diagnostics",
+        route,
+        method,
+        status = response.status().as_u16(),
+        oauth_error = error.map_or("none", |e| e.0),
+        reason = reason.map_or("none", |r| r.label()),
+        auth_method = registration.map(|r| r.auth_method),
+        grant_types_present = registration.map(|r| r.grant_types_present),
+        grant_authcode = registration.map(|r| r.grant_authcode),
+        grant_refresh = registration.map(|r| r.grant_refresh),
+        grant_other = registration.map(|r| r.grant_other),
+        "local OAuth request"
+    );
+    response
 }
 
 struct Failure(StatusCode, &'static str);
@@ -293,7 +490,9 @@ fn secure(mut response: Response) -> Response {
 }
 
 fn error(status: StatusCode, name: &'static str) -> Response {
-    secure((status, Json(json!({"error": name}))).into_response())
+    let mut response = secure((status, Json(json!({"error": name}))).into_response());
+    response.extensions_mut().insert(diagnostic_error(name));
+    response
 }
 
 fn one_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -314,15 +513,37 @@ async fn guard(State(auth): State<LocalOAuth>, request: Request, next: Next) -> 
         !request.headers().contains_key("origin")
     };
     if !host_ok || !origin_ok {
-        return error(StatusCode::FORBIDDEN, "access_denied");
+        let reason = if !host_ok {
+            DiagnosticReason::HostRejected
+        } else {
+            DiagnosticReason::OriginRejected
+        };
+        return reason.attach(error(StatusCode::FORBIDDEN, "access_denied"));
     }
     if request.method() == Method::POST && request.uri().query().is_some() {
-        return error(StatusCode::BAD_REQUEST, "invalid_request");
+        return DiagnosticReason::PostQuery
+            .attach(error(StatusCode::BAD_REQUEST, "invalid_request"));
     }
     if request.uri().to_string().len() > MAX_BODY {
-        return error(StatusCode::URI_TOO_LONG, "invalid_request");
+        return DiagnosticReason::UriTooLong
+            .attach(error(StatusCode::URI_TOO_LONG, "invalid_request"));
     }
-    secure(next.run(request).await)
+    let mut response = secure(next.run(request).await);
+    if response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_some_and(|value| {
+            value
+                .to_str()
+                .is_ok_and(|value| value.starts_with("text/html"))
+        })
+    {
+        // A no-referrer form document makes browser POST Origin opaque (null).
+        response
+            .headers_mut()
+            .insert("referrer-policy", HeaderValue::from_static("same-origin"));
+    }
+    response
 }
 
 pub(crate) async fn require_token(
@@ -353,7 +574,7 @@ async fn as_metadata(State(auth): State<LocalOAuth>) -> Response {
         "token_endpoint": format!("{issuer}/oauth/token"),
         "registration_endpoint": format!("{issuer}/oauth/register"),
         "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
         "token_endpoint_auth_methods_supported": ["none"],
         "code_challenge_methods_supported": ["S256"],
         "scopes_supported": [SCOPE],
@@ -425,12 +646,40 @@ fn fields(encoded: &[u8]) -> Result<Fields, Failure> {
         .map_err(|_| Failure(StatusCode::BAD_REQUEST, "invalid_request"))?;
     let mut result = Fields::new();
     for (key, value) in form_urlencoded::parse(encoded) {
-        if key.len() > 64
-            || value.len() > 2048
-            || result.len() >= 16
-            || result
-                .insert(key.into_owned(), value.into_owned())
-                .is_some()
+        let recognized = matches!(
+            key.as_ref(),
+            "client_id"
+                | "redirect_uri"
+                | "response_type"
+                | "response_mode"
+                | "scope"
+                | "resource"
+                | "state"
+                | "code_challenge"
+                | "code_challenge_method"
+                | "grant_type"
+                | "code"
+                | "code_verifier"
+                | "csrf"
+                | "decision"
+                | "owner_secret"
+                | "client_secret"
+                | "client_assertion"
+                | "client_assertion_type"
+                | "access_token"
+                | "refresh_token"
+                | "password"
+                | "token"
+                | "request"
+                | "request_uri"
+        );
+        if key.len() > 64 || value.len() > 2048 || result.len() >= 32 {
+            return Err(Failure(StatusCode::BAD_REQUEST, "invalid_request"));
+        }
+        if result
+            .insert(key.into_owned(), value.into_owned())
+            .is_some()
+            && recognized
         {
             return Err(Failure(StatusCode::BAD_REQUEST, "invalid_request"));
         }
@@ -443,7 +692,6 @@ fn param<'a>(fields: &'a Fields, name: &str) -> &'a str {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Registration {
     redirect_uris: Vec<String>,
     client_name: Option<String>,
@@ -451,6 +699,42 @@ struct Registration {
     grant_types: Option<Vec<String>>,
     response_types: Option<Vec<String>>,
     scope: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct RegistrationDiagnostic {
+    auth_method: &'static str,
+    grant_types_present: bool,
+    grant_authcode: bool,
+    grant_refresh: bool,
+    grant_other: bool,
+}
+
+fn registration_diagnostic(registration: &Registration) -> RegistrationDiagnostic {
+    let grants = registration.grant_types.as_deref().unwrap_or_default();
+    RegistrationDiagnostic {
+        auth_method: match registration.token_endpoint_auth_method.as_deref() {
+            None => "omitted",
+            Some("none") => "none",
+            Some("client_secret_basic") => "client_secret_basic",
+            Some("client_secret_post") => "client_secret_post",
+            Some(_) => "other",
+        },
+        grant_types_present: registration.grant_types.is_some(),
+        grant_authcode: grants.iter().any(|g| g == "authorization_code"),
+        grant_refresh: grants.iter().any(|g| g == "refresh_token"),
+        grant_other: grants
+            .iter()
+            .any(|g| g != "authorization_code" && g != "refresh_token"),
+    }
+}
+
+impl RegistrationDiagnostic {
+    fn attach(self, response: Response, reason: DiagnosticReason) -> Response {
+        let mut response = reason.attach(response);
+        response.extensions_mut().insert(self);
+        response
+    }
 }
 
 fn valid_redirect(value: &str) -> bool {
@@ -484,58 +768,127 @@ async fn register(State(auth): State<LocalOAuth>, request: Request) -> Response 
     {
         let mut store = auth.0.store.lock().unwrap();
         store.prune(now);
-        if !store.registration_rate.allow(now, 16) {
-            return error(StatusCode::TOO_MANY_REQUESTS, "slow_down");
+        if !store.registration_rate.allow(now, REGISTRATION_RATE) {
+            return DiagnosticReason::RegistrationRate
+                .attach(error(StatusCode::TOO_MANY_REQUESTS, "slow_down"));
         }
     }
     let bytes = match body(&auth, request, "application/json").await {
         Ok(b) => b,
-        Err(e) => return e.into_response(),
+        Err(e) => return DiagnosticReason::BodyRejected.attach(e.into_response()),
     };
     let registration: Registration = match serde_json::from_slice(&bytes) {
         Ok(r) => r,
-        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid_client_metadata"),
+        Err(_) => {
+            return DiagnosticReason::InvalidJson
+                .attach(error(StatusCode::BAD_REQUEST, "invalid_client_metadata"));
+        }
     };
-    if registration.redirect_uris.is_empty()
+    let diagnostic = registration_diagnostic(&registration);
+    let rejection = if registration.redirect_uris.is_empty()
         || registration.redirect_uris.len() > 8
         || registration
             .redirect_uris
             .iter()
             .any(|u| !valid_redirect(u))
-        || registration
-            .client_name
-            .as_ref()
-            .is_some_and(|n| n.len() > 128 || n.chars().any(char::is_control))
-        || registration
-            .token_endpoint_auth_method
-            .as_deref()
-            .is_some_and(|m| m != "none")
-        || registration
-            .grant_types
-            .as_ref()
-            .is_some_and(|g| g != &["authorization_code"])
-        || registration
-            .response_types
-            .as_ref()
-            .is_some_and(|r| r != &["code"])
-        || registration.scope.as_deref().is_some_and(|s| s != SCOPE)
     {
-        return error(StatusCode::BAD_REQUEST, "invalid_client_metadata");
+        Some(DiagnosticReason::InvalidRedirect)
+    } else if registration
+        .client_name
+        .as_ref()
+        .is_some_and(|n| n.len() > 128 || n.chars().any(char::is_control))
+    {
+        Some(DiagnosticReason::InvalidClientName)
+    } else if registration
+        .token_endpoint_auth_method
+        .as_deref()
+        .is_some_and(|m| m != "none")
+    {
+        Some(DiagnosticReason::UnsupportedAuthMethod)
+    } else if registration.grant_types.as_ref().is_some_and(|g| {
+        !g.iter().any(|v| v == "authorization_code")
+            || g.iter()
+                .any(|v| v != "authorization_code" && v != "refresh_token")
+            || g.iter().collect::<HashSet<_>>().len() != g.len()
+    }) {
+        Some(DiagnosticReason::UnsupportedGrant)
+    } else if registration
+        .response_types
+        .as_ref()
+        .is_some_and(|r| r != &["code"])
+    {
+        Some(DiagnosticReason::UnsupportedResponse)
+    } else if registration.scope.as_deref().is_some_and(|s| s != SCOPE) {
+        Some(DiagnosticReason::UnsupportedScope)
+    } else {
+        None
+    };
+    if let Some(reason) = rejection {
+        return diagnostic.attach(
+            error(StatusCode::BAD_REQUEST, "invalid_client_metadata"),
+            reason,
+        );
     }
     let id = match random() {
         Ok(id) => id,
-        Err(e) => return e.into_response(),
+        Err(e) => return diagnostic.attach(e.into_response(), DiagnosticReason::RandomUnavailable),
     };
     let mut store = auth.0.store.lock().unwrap();
-    if store.clients.len() >= MAX_CLIENTS {
-        return error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable");
+    // No client identity exists yet: bound registrations by validated callback
+    // origin as well as aggregate work. Never fetch descriptive metadata URLs.
+    let origins: HashSet<_> = registration
+        .redirect_uris
+        .iter()
+        .map(|uri| Url::parse(uri).unwrap().origin().ascii_serialization())
+        .collect();
+    let new_origins = origins
+        .iter()
+        .filter(|origin| !store.registration_origins.contains_key(*origin))
+        .count();
+    if store.registration_origins.len() + new_origins > MAX_REGISTRATION_ORIGINS {
+        return diagnostic.attach(
+            error(StatusCode::TOO_MANY_REQUESTS, "slow_down"),
+            DiagnosticReason::OriginCapacity,
+        );
     }
+    for origin in origins {
+        if !store
+            .registration_origins
+            .entry(origin)
+            .or_default()
+            .allow(now, 16)
+        {
+            return diagnostic.attach(
+                error(StatusCode::TOO_MANY_REQUESTS, "slow_down"),
+                DiagnosticReason::OriginRate,
+            );
+        }
+    }
+    if store.clients.len() >= MAX_CLIENTS
+        || store
+            .clients
+            .values()
+            .filter(|client| !client.approved)
+            .count()
+            >= MAX_UNAPPROVED_CLIENTS
+    {
+        return diagnostic.attach(
+            error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable"),
+            DiagnosticReason::ClientCapacity,
+        );
+    }
+    let refresh_allowed = diagnostic.grant_refresh;
+    let grants = if refresh_allowed {
+        vec!["authorization_code", "refresh_token"]
+    } else {
+        vec!["authorization_code"]
+    };
     let response = (
         StatusCode::CREATED,
         Json(json!({
-            "client_id": id, "client_id_expires_in": CLIENT_TTL.as_secs(),
+            "client_id": id,
             "redirect_uris": registration.redirect_uris, "client_name": registration.client_name,
-            "token_endpoint_auth_method": "none", "grant_types": ["authorization_code"],
+            "token_endpoint_auth_method": "none", "grant_types": grants,
             "response_types": ["code"], "scope": SCOPE,
         })),
     )
@@ -548,12 +901,17 @@ async fn register(State(auth): State<LocalOAuth>, request: Request) -> Response 
                 .client_name
                 .unwrap_or_else(|| "Unnamed public client".into()),
             expires: now + CLIENT_TTL,
+            approved: false,
+            refresh_allowed,
+            authorization_rate: Rate::default(),
+            login_rate: Rate::default(),
+            exchange_rate: Rate::default(),
         },
     );
-    response
+    diagnostic.attach(response, DiagnosticReason::Registered)
 }
 
-fn redirect(
+fn completion(
     auth: &LocalOAuth,
     target: &str,
     state: Option<&str>,
@@ -570,7 +928,16 @@ fn redirect(
             pairs.append_pair("state", state);
         }
     }
-    (StatusCode::SEE_OTHER, [(header::LOCATION, url.as_str())]).into_response()
+    // An ordinary user-clicked link is not a form-action redirect. Keep the
+    // callback/code private and do not navigate externally without another click.
+    let mut response = Html(format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Complete qmcp authorization</title></head><body><h1>Complete authorization</h1><p>Continue to the callback you reviewed, including after denial.</p><a href=\"{}\" rel=\"noreferrer noopener\">Continue to ChatGPT</a></body></html>",
+        escape(url.as_str())
+    )).into_response();
+    if key == "error" {
+        response.extensions_mut().insert(diagnostic_error(value));
+    }
+    response
 }
 
 fn escape(text: &str) -> String {
@@ -596,36 +963,48 @@ async fn authorize(State(auth): State<LocalOAuth>, request: Request) -> Response
     };
     // Never accept a credential in a URL, even as an unknown extension parameter.
     if fields.keys().any(|k| {
-        !matches!(
+        matches!(
             k.as_str(),
-            "client_id"
-                | "redirect_uri"
-                | "response_type"
-                | "scope"
-                | "resource"
-                | "state"
-                | "code_challenge"
-                | "code_challenge_method"
+            "owner_secret"
+                | "client_secret"
+                | "client_assertion"
+                | "client_assertion_type"
+                | "access_token"
+                | "refresh_token"
+                | "code"
+                | "code_verifier"
+                | "password"
+                | "token"
         )
     }) || fields.get("state").is_some_and(|s| s.len() > 1024)
+        || fields
+            .get("response_mode")
+            .is_some_and(|mode| mode != "query")
+        || fields.contains_key("request")
+        || fields.contains_key("request_uri")
     {
         return error(StatusCode::BAD_REQUEST, "invalid_request");
     }
     let now = Instant::now();
     let mut store = auth.0.store.lock().unwrap();
     store.prune(now);
-    if !store.authorization_rate.allow(now, 60) {
+    if !store.authorization_rate.allow(now, AGGREGATE_RATE) {
         return error(StatusCode::TOO_MANY_REQUESTS, "slow_down");
     }
-    let Some(client) = store.clients.get(param(&fields, "client_id")) else {
+    let Some(client) = store.clients.get_mut(param(&fields, "client_id")) else {
         return error(StatusCode::BAD_REQUEST, "invalid_client");
     };
+    if !client.authorization_rate.allow(now, 30) {
+        return error(StatusCode::TOO_MANY_REQUESTS, "slow_down");
+    }
+    let name = escape(&client.name);
+    let refresh_allowed = client.refresh_allowed;
     let target = param(&fields, "redirect_uri");
     if !client.redirects.iter().any(|r| r == target) {
         return error(StatusCode::BAD_REQUEST, "invalid_request");
     }
     let state = fields.get("state").cloned();
-    let fail = |name| redirect(&auth, target, state.as_deref(), "error", name);
+    let fail = |name| completion(&auth, target, state.as_deref(), "error", name);
     if param(&fields, "response_type") != "code" {
         return fail("unsupported_response_type");
     }
@@ -645,10 +1024,16 @@ async fn authorize(State(auth): State<LocalOAuth>, request: Request) -> Response
     {
         return fail("invalid_request");
     }
-    if store.transactions.len() >= MAX_TRANSACTIONS {
+    if store.transactions.len() >= MAX_TRANSACTIONS
+        || store
+            .transactions
+            .values()
+            .filter(|t| t.grant.client == param(&fields, "client_id"))
+            .count()
+            >= MAX_CLIENT_TRANSACTIONS
+    {
         return fail("temporarily_unavailable");
     }
-    let name = escape(&client.name);
     let transaction = match random() {
         Ok(v) => v,
         Err(e) => return e.into_response(),
@@ -657,8 +1042,17 @@ async fn authorize(State(auth): State<LocalOAuth>, request: Request) -> Response
         Ok(v) => v,
         Err(e) => return e.into_response(),
     };
+    let access_minutes = TOKEN_TTL.as_secs() / 60;
+    let duration = if refresh_allowed {
+        format!(
+            "Each access token lasts up to {access_minutes} minutes. Access can be renewed without a new login for up to {} hours from the initial code exchange; renewal does not extend this deadline.",
+            FAMILY_TTL.as_secs() / 3600
+        )
+    } else {
+        format!("Access lasts up to {access_minutes} minutes.")
+    };
     let html = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>qmcp owner login and authorization</title></head><body><h1>Owner login + authorize</h1><p>Unverified public client: <strong>{name}</strong></p><p>Redirect: {}</p><p>Approve grants all QueryMT tools on {} (scope {SCOPE}) for 30 minutes. Only approve a client and callback you trust.</p><form method=\"post\" action=\"/oauth/authorize\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><label>Generated owner secret <input type=\"password\" name=\"owner_secret\" autocomplete=\"off\" maxlength=\"128\"></label><button type=\"submit\" name=\"decision\" value=\"approve\">Log in and Approve</button><button type=\"submit\" name=\"decision\" value=\"deny\">Deny</button></form></body></html>",
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>qmcp owner login and authorization</title></head><body><h1>Owner login + authorize</h1><p>Unverified public client: <strong>{name}</strong></p><p>Redirect: {}</p><p>Approve grants all QueryMT tools on {} (scope {SCOPE}). {duration} Only approve a client and callback you trust.</p><form method=\"post\" action=\"/oauth/authorize\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><label>Generated owner secret <input type=\"password\" name=\"owner_secret\" autocomplete=\"off\" maxlength=\"128\"></label><button type=\"submit\" name=\"decision\" value=\"approve\">Log in and Approve</button><button type=\"submit\" name=\"decision\" value=\"deny\">Deny</button></form></body></html>",
         escape(target),
         escape(&auth.0.resource)
     );
@@ -717,32 +1111,52 @@ async fn consent(State(auth): State<LocalOAuth>, request: Request) -> Response {
     let now = Instant::now();
     let mut store = auth.0.store.lock().unwrap();
     store.prune(now);
-    if !store.login_rate.allow(now, 8) {
-        return error(StatusCode::TOO_MANY_REQUESTS, "slow_down");
-    }
-    // Each submitted transaction gets exactly one attempt, including CSRF/owner failures.
-    let Some(transaction) = transaction.and_then(|id| store.transactions.remove(&id)) else {
+    // Exact Origin is checked by guard before any body or owner-attempt work.
+    // Invalid cookies/CSRF neither consume an attempt nor destroy a valid flow.
+    let Some(id) = transaction else {
+        return error(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+    let Some(transaction) = store.transactions.get(&id) else {
         return error(StatusCode::BAD_REQUEST, "invalid_request");
     };
     if !bool::from(transaction.csrf.ct_eq(&digest(param(&fields, "csrf")))) {
         return error(StatusCode::FORBIDDEN, "access_denied");
     }
+    let client_id = transaction.grant.client.clone();
+    let Some(client) = store.clients.get_mut(&client_id) else {
+        return error(StatusCode::BAD_REQUEST, "invalid_client");
+    };
+    if !client.login_rate.allow(now, 8) {
+        return error(StatusCode::TOO_MANY_REQUESTS, "slow_down");
+    }
+    // One owner attempt per CSRF-validated transaction, bounded per client.
+    let transaction = store.transactions.remove(&id).unwrap();
     let grant = transaction.grant;
-    let result = if param(&fields, "decision") != "approve"
-        || fields
+    let approved = param(&fields, "decision") == "approve"
+        && !fields
             .keys()
             .any(|k| !matches!(k.as_str(), "csrf" | "decision" | "owner_secret"))
-        || !bool::from(auth.0.owner.ct_eq(&digest(param(&fields, "owner_secret"))))
-    {
-        redirect(
+        && bool::from(auth.0.owner.ct_eq(&digest(param(&fields, "owner_secret"))));
+    if approved {
+        store.clients.get_mut(&grant.client).unwrap().approved = true;
+    }
+    let result = if !approved {
+        completion(
             &auth,
             &grant.redirect,
             transaction.state.as_deref(),
             "error",
             "access_denied",
         )
-    } else if store.codes.len() >= MAX_CODES || !store.clients.contains_key(&grant.client) {
-        redirect(
+    } else if store.codes.len() >= MAX_CODES
+        || store
+            .codes
+            .values()
+            .filter(|code| code.grant.client == grant.client)
+            .count()
+            >= MAX_CLIENT_CODES
+    {
+        completion(
             &auth,
             &grant.redirect,
             transaction.state.as_deref(),
@@ -754,7 +1168,7 @@ async fn consent(State(auth): State<LocalOAuth>, request: Request) -> Response {
             Ok(v) => v,
             Err(e) => return e.into_response(),
         };
-        let result = redirect(
+        let result = completion(
             &auth,
             &grant.redirect,
             transaction.state.as_deref(),
@@ -781,11 +1195,11 @@ async fn exchange(State(auth): State<LocalOAuth>, request: Request) -> Response 
     if request.headers().contains_key(header::AUTHORIZATION) {
         return error(StatusCode::BAD_REQUEST, "invalid_client");
     }
-    let now = Instant::now();
     {
+        let now = Instant::now();
         let mut store = auth.0.store.lock().unwrap();
         store.prune(now);
-        if !store.exchange_rate.allow(now, 120) {
+        if !store.exchange_rate.allow(now, AGGREGATE_RATE) {
             return error(StatusCode::TOO_MANY_REQUESTS, "slow_down");
         }
     }
@@ -798,55 +1212,223 @@ async fn exchange(State(auth): State<LocalOAuth>, request: Request) -> Response 
         Err(e) => return e.into_response(),
     };
     let mut store = auth.0.store.lock().unwrap();
-    // Remove under the same lock as validation/issuance: one use even on wrong bindings/PKCE.
-    let Some(code) = store.codes.remove(&digest(param(&fields, "code"))) else {
+    let now = Instant::now();
+    store.prune(now);
+    match param(&fields, "grant_type") {
+        "authorization_code" => exchange_code(&mut store, &fields, now),
+        "refresh_token" => exchange_refresh(&mut store, &fields, now),
+        _ => error(StatusCode::BAD_REQUEST, "unsupported_grant_type"),
+    }
+}
+
+fn exchange_code(store: &mut Store, fields: &Fields, now: Instant) -> Response {
+    let id = digest(param(fields, "code"));
+    // Unknown codes cannot consume a named client's budget.
+    if let Some(code) = store.codes.get(&id) {
+        let actual_client = code.grant.client.clone();
+        if let Some(client) = store.clients.get_mut(&actual_client)
+            && !client.exchange_rate.allow(now, 60)
+        {
+            return error(StatusCode::TOO_MANY_REQUESTS, "slow_down");
+        }
+    }
+    let Some(code) = store.codes.get(&id) else {
         return error(StatusCode::BAD_REQUEST, "invalid_grant");
     };
-    let verifier = param(&fields, "code_verifier");
+    let verifier = param(fields, "code_verifier");
     let verifier_ok = (43..=128).contains(&verifier.len())
         && verifier
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b));
-    if code.expires <= Instant::now()
-        || fields.keys().any(|k| {
-            !matches!(
-                k.as_str(),
-                "grant_type"
-                    | "client_id"
-                    | "redirect_uri"
-                    | "resource"
-                    | "scope"
-                    | "code"
-                    | "code_verifier"
-            )
-        })
-        || param(&fields, "grant_type") != "authorization_code"
-        || param(&fields, "client_id") != code.grant.client
-        || param(&fields, "redirect_uri") != code.grant.redirect
-        || param(&fields, "resource") != code.grant.resource
+    if code.expires <= now
+        || fields.contains_key("client_secret")
+        || fields.contains_key("client_assertion")
+        || fields.contains_key("client_assertion_type")
+        || param(fields, "client_id") != code.grant.client
+        || param(fields, "redirect_uri") != code.grant.redirect
+        || param(fields, "resource") != code.grant.resource
         || fields.get("scope").is_some_and(|s| s != &code.grant.scope)
         || !verifier_ok
         || !bool::from(code.grant.challenge.ct_eq(&digest(verifier)))
     {
+        // Failed PKCE/bindings consume the code; transient capacity failures do not.
+        store.codes.remove(&id);
         return error(StatusCode::BAD_REQUEST, "invalid_grant");
     }
-    if store.tokens.len() >= MAX_TOKENS {
+    let refresh_allowed = store
+        .clients
+        .get(&code.grant.client)
+        .is_some_and(|client| client.approved && client.refresh_allowed);
+    if !store.access_capacity(&code.grant.client)
+        || (refresh_allowed && !store.family_capacity(&code.grant.client))
+    {
         return error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable");
     }
     let token = match random() {
         Ok(v) => v,
         Err(e) => return e.into_response(),
     };
+    let refresh = if refresh_allowed {
+        match random() {
+            Ok(v) => Some(v),
+            Err(e) => return e.into_response(),
+        }
+    } else {
+        None
+    };
+    // Validation, capacity checks, removal and all issuance share the same lock.
+    let grant = store.codes.remove(&id).unwrap().grant;
+    let family_id = refresh.as_deref().map(digest);
+    if let Some(family) = family_id {
+        store.families.insert(
+            family,
+            Family {
+                client: grant.client.clone(),
+                resource: grant.resource.clone(),
+                scope: grant.scope.clone(),
+                expires: now + FAMILY_TTL,
+                records: 1,
+                revoked: false,
+            },
+        );
+        store.refresh.insert(
+            family,
+            RefreshRecord {
+                family,
+                consumed: false,
+            },
+        );
+    }
     store.tokens.insert(
         digest(&token),
         Token {
-            client: code.grant.client,
-            resource: code.grant.resource,
-            scope: code.grant.scope,
-            expires: Instant::now() + TOKEN_TTL,
+            family: family_id,
+            client: grant.client,
+            resource: grant.resource,
+            scope: grant.scope,
+            expires: now + TOKEN_TTL,
         },
     );
-    Json(json!({ "access_token": token, "token_type": "Bearer", "expires_in": TOKEN_TTL.as_secs(), "scope": SCOPE })).into_response()
+    token_response(token, refresh, TOKEN_TTL)
+}
+
+fn exchange_refresh(store: &mut Store, fields: &Fields, now: Instant) -> Response {
+    let raw = param(fields, "refresh_token");
+    // Only canonical 32-byte opaque credentials, never mixed authentication/grant material.
+    if raw.len() != 43
+        || !URL_SAFE_NO_PAD
+            .decode(raw)
+            .is_ok_and(|bytes| bytes.len() == 32 && URL_SAFE_NO_PAD.encode(bytes) == raw)
+        || param(fields, "client_id").is_empty()
+        || [
+            "client_secret",
+            "client_assertion",
+            "client_assertion_type",
+            "code",
+            "code_verifier",
+            "redirect_uri",
+            "owner_secret",
+            "password",
+            "access_token",
+            "token",
+        ]
+        .iter()
+        .any(|key| fields.contains_key(*key))
+    {
+        return error(StatusCode::BAD_REQUEST, "invalid_grant");
+    }
+    let id = digest(raw);
+    let Some(record) = store.refresh.get(&id) else {
+        return error(StatusCode::BAD_REQUEST, "invalid_grant");
+    };
+    let family_id = record.family;
+    let family = &store.families[&family_id];
+    if family.revoked
+        || family.expires <= now
+        || param(fields, "client_id") != family.client
+        || !store
+            .clients
+            .get(&family.client)
+            .is_some_and(|c| c.approved && c.refresh_allowed)
+    {
+        return error(StatusCode::BAD_REQUEST, "invalid_grant");
+    }
+    // Validate bindings before replay handling: malformed/wrong-target attempts do not revoke.
+    // RFC 8707 permits omission to reuse the original (single) bound resource.
+    if fields
+        .get("resource")
+        .is_some_and(|resource| resource != &family.resource)
+    {
+        return error(StatusCode::BAD_REQUEST, "invalid_target");
+    }
+    if fields
+        .get("scope")
+        .is_some_and(|scope| scope != &family.scope)
+    {
+        return error(StatusCode::BAD_REQUEST, "invalid_scope");
+    }
+    if record.consumed {
+        store.revoke_family(family_id);
+        return error(StatusCode::BAD_REQUEST, "invalid_grant");
+    }
+    let client_id = family.client.clone();
+    let resource = family.resource.clone();
+    let scope = family.scope.clone();
+    let expires = family.expires;
+    let records = family.records;
+    if !store
+        .clients
+        .get_mut(&client_id)
+        .unwrap()
+        .exchange_rate
+        .allow(now, 60)
+    {
+        return error(StatusCode::TOO_MANY_REQUESTS, "slow_down");
+    }
+    if !store.access_capacity(&client_id)
+        || store.refresh.len() >= MAX_REFRESH_RECORDS
+        || records >= MAX_FAMILY_RECORDS
+    {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable");
+    }
+    let token = match random() {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    let refresh = match random() {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    let ttl = TOKEN_TTL.min(expires.duration_since(now));
+    store.refresh.get_mut(&id).unwrap().consumed = true;
+    store.families.get_mut(&family_id).unwrap().records += 1;
+    store.refresh.insert(
+        digest(&refresh),
+        RefreshRecord {
+            family: family_id,
+            consumed: false,
+        },
+    );
+    store.tokens.insert(
+        digest(&token),
+        Token {
+            family: Some(family_id),
+            client: client_id,
+            resource,
+            scope,
+            expires: now + ttl,
+        },
+    );
+    token_response(token, Some(refresh), ttl)
+}
+
+fn token_response(access: String, refresh: Option<String>, ttl: Duration) -> Response {
+    let mut response = json!({ "access_token": access, "token_type": "Bearer",
+        "expires_in": ttl.as_secs(), "scope": SCOPE });
+    if let Some(refresh) = refresh {
+        response["refresh_token"] = refresh.into();
+    }
+    Json(response).into_response()
 }
 
 #[cfg(test)]

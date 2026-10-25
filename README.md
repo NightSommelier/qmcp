@@ -35,8 +35,14 @@ These are example values, not a deployment configuration. See
 [How to connect](docs/how-to-connect.md#embedded-oauth-on-macos-chatgpt) for secret
 generation, proxy setup and ChatGPT sign-in. Embedded OAuth is single-owner and
 volatile: restarting invalidates tokens **and registered client IDs**, so you may
-need to re-add the server in ChatGPT. Registrations also expire after one hour;
-tokens last 30 minutes, with no refresh tokens.
+need to re-add the server in ChatGPT. Only unapproved registrations expire after
+one hour; approved registrations survive until restart. Discovery advertises
+PKCE authorization-code and rotating refresh-token grants. Access tokens last
+30 minutes (capped at family expiry); clients registered for refresh receive
+one-use refresh tokens with an absolute 24-hour family lifetime from the initial
+code exchange, never extended by rotation. Replay revokes the family's access
+and refresh tokens. Restart invalidates refresh state too; see the guide for
+capacity limits and serialized-refresh requirements.
 
 Local stdio, static Bearer over HTTPS, private tunnels, and optional external
 OAuth introspection remain available in the [connection guide](docs/how-to-connect.md).

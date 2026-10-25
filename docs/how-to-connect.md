@@ -158,44 +158,122 @@ In ChatGPT, add a custom MCP server with `https://mcp.example.com/mcp` and selec
 as a client ID/secret. During sign-in, verify the public domain, the unverified
 client name, and its exact callback URL. Enter the generated owner secret on
 qmcp's **Owner login + authorize** page and explicitly choose **Log in and
-Approve**, or choose **Deny**. Registration alone grants no access. Workspace
-settings must allow custom MCP servers. The flow is covered by local tests;
-live ChatGPT interoperability still needs deployment validation.
+Approve**, or choose **Deny**. Then explicitly click **Continue to ChatGPT** on
+the completion page (also after denial). This extra click returns the code or
+error, state, and issuer to the registered callback; there is no automatic
+cross-origin redirect after form submission. Registration alone grants no
+access. Workspace settings must allow custom MCP servers. The flow is covered
+by local tests; live ChatGPT interoperability still needs deployment validation.
+
+### Private OAuth diagnostics
+
+For a reviewed deployment, opt in with
+`RUST_LOG='warn,qmcp::oauth_diagnostics=info'` in the qmcp process environment.
+Keep stderr private. This target logs fixed route/method labels, HTTP status,
+allowlisted OAuth error/rejection reasons, and normalized DCR authentication and
+recognized grant flags only. Unknown routes become `/other`; no header values,
+URLs, queries, bodies, client IDs, remote IPs, or credentials are logged.
+Unknown registration metadata remains ignored. Do not enable broader
+`rmcp`/`reqwest` debug or trace logs to diagnose app creation.
+
+These diagnostics identify which requests reach qmcp and how it responds; they
+do not establish the cause of a generic ChatGPT rejection without a retry.
+Enabling them in a new process requires a reviewed restart, which discards all
+volatile OAuth state; re-registration may be needed.
 
 ### Security and operational limits
 
-- Only public DCR clients, authorization-code grants, and PKCE `S256` are
-  supported. No implicit grant, refresh tokens, CIMD URL fetching, or client
-  secret authentication. Registration never fetches a supplied URL.
+- Discovery advertises authorization-code and refresh-token grants for public
+  DCR clients (`token_endpoint_auth_method: none`), with PKCE `S256` required
+  for the initial code exchange. Registration requires `authorization_code`;
+  `refresh_token` is optional. The grant set is order independent, with no
+  duplicates or unsupported grants; omission defaults to authorization-code
+  only. The response echoes the normalized registered set. Only clients that
+  register the refresh grant receive refresh tokens after explicit owner approval
+  and a valid PKCE exchange. No implicit grant, CIMD URL fetching, or client
+  secret authentication is supported. Registration never fetches a supplied URL.
 - The exact registered redirect, public resource, client, and `qmcp:access`
   scope are bound to authorization and code exchange. HTTPS callbacks are
   required except literal loopback/localhost HTTP callbacks. Redirects with
   fragments, credentials, or reserved OAuth response query fields are rejected.
-  Unknown registration metadata is rejected; up to eight redirects and a
-  128-byte client name are accepted within an 8 KiB request body.
+  Unknown descriptive registration metadata (including `client_uri` and
+  `logo_uri`) and authorization/token extension parameters are ignored, never
+  fetched or rendered. Known security parameters remain strict, including
+  duplicate rejection; unsupported grants and authentication/PKCE methods are
+  rejected. Credential-bearing authorization query parameters are rejected.
+  Up to eight redirects and a 128-byte client name fit in an 8 KiB body.
 - Each five-minute browser transaction requires a random CSRF token and a
   Secure, HttpOnly, SameSite=Lax, path-scoped cookie. Form POSTs require the
   exact issuer Origin. MCP and all other routes reject Origin; never strip it
-  at the proxy to bypass validation. Each submitted transaction has one owner
-  login attempt. There is no remembered login or silent approval.
+  at the proxy to bypass validation. Login and completion HTML use
+  `Referrer-Policy: same-origin` so real form submissions retain the exact
+  Origin; `Origin: null` is never accepted. Invalid cookies, CSRF, or Origin
+  do not consume owner attempts or destroy a valid transaction. Each validated
+  transaction has one owner attempt, with eight attempts per client per minute.
+  There is no remembered login or silent approval.
 - Codes expire after 90 seconds and are consumed atomically, including on a
-  failed binding/PKCE check. Access tokens expire after 30 minutes. Only
-  SHA-256 digests of owner credentials, cookies, CSRF tokens, codes and access
-  tokens are retained in server state. Responses use no-store and restrictive
-  CSP, framing and referrer policies.
+  failed binding/PKCE check. Transient capacity failures leave a valid code usable
+  until its original expiry. Access tokens last 30 minutes, capped at their
+  refresh family's deadline when applicable. Only SHA-256 digests of owner
+  credentials, cookies, CSRF tokens, codes, access tokens and refresh tokens are
+  retained in server state. Tokens are opaque, generated from 32 cryptographically
+  random bytes. Responses use no-store and restrictive
+  CSP, framing and referrer policies. Completion pages contain a normal escaped
+  callback link with `rel="noreferrer noopener"`, no scripts, forms, or automatic
+  navigation. Codes in that private HTML must not be logged or cached.
+- Refresh families have an **absolute 24-hour lifetime from the initial code
+  exchange**; rotation never extends that deadline. Refresh uses `/oauth/token`
+  with `grant_type=refresh_token`, the public `client_id`, and `refresh_token`.
+  It does not require browser cookies, another owner login, or client secrets:
+  possession of the refresh token is the authorization. The client, original
+  canonical resource and `qmcp:access` scope remain bound. An omitted `resource`
+  reuses the original resource (RFC 8707); if supplied, it must match exactly.
+  Scope must be omitted or exactly `qmcp:access`, never expanded. Host, no-Origin,
+  duplicate-security-parameter and no-POST-query guards still apply.
+- Every successful refresh atomically consumes its token and issues new access
+  and refresh tokens. Consumed digests remain until family expiry, including
+  after revocation. Reusing a consumed token with valid client/resource/scope
+  bindings returns `400 invalid_grant` and revokes **all access and refresh tokens
+  in that family**, not other families (even for the same client). Wrong bindings
+  or malformed requests do not consume a valid token or revoke a family. Clients
+  must serialize refreshes: concurrent exchanges issue at most one response,
+  and the other request is a replay that revokes even the winner's tokens. A lost
+  successful response followed by retry also requires a new owner authorization.
+  There is no refresh reuse grace period, external-provider delegation or silent
+  recovery after replay, absolute expiry, or the chain limit.
 - All state is **volatile**. Restart invalidates grants, tokens, transactions,
   and DCR client IDs; ChatGPT may require removing and re-adding the server,
-  not just signing in again. Client registrations also expire after one hour;
-  their expiration may require re-registration/re-adding. There is no database,
-  registration management API, per-client revocation, or persistence.
-- Capacity is 128 clients, 128 browser transactions, 128 codes and 256 tokens.
-  Expired entries are pruned on use. Global fixed-memory limits per minute are
-  16 registrations, 60 authorizations, 8 login POSTs and 120 token requests.
+  not just signing in again. Valid owner approval retains that client identity
+  until process restart; only unapproved registrations expire after one hour.
+  There is no database, registration management API, per-client revocation, or
+  persistence.
+- Capacity is 128 clients (at most 96 unapproved), 128 browser transactions,
+  128 codes and 256 access tokens. Approved identities are never evicted by spam.
+  Each client can hold at most eight transactions, eight codes and 16 access
+  tokens. Refresh state is capped at 128 families globally, eight per client,
+  8,192 total refresh digests, and 128 digests per family (the original plus at
+  most 127 rotations). Revoked families still occupy their slots until expiry.
+  Live access tokens are retained until expiry or family revocation; frequent
+  refreshes can hit the access-token limit before the chain limit. Capacity
+  exhaustion returns `503 temporarily_unavailable` without consuming a valid
+  code/current refresh token; rate exhaustion returns `429 slow_down`. No replay
+  evidence is evicted to make room. At the chain limit a new owner authorization
+  is needed. All expired state is pruned on use. Per-minute limits are 30
+  authorizations and 60 known-code/validly-bound-refresh exchanges per client;
+  unknown credentials cannot spend a named client's exchange budget. Registration has no authenticated client identity:
+  each validated callback origin gets 16 registrations/minute, with at most
+  256 fixed-memory origin buckets. Aggregate ceilings are 1,024 registration
+  requests and 4,096 authorization/token requests per endpoint per minute,
+  not a tiny shared owner-login lockout.
   AS bodies have an 8 KiB limit, 16 concurrent readers and a ten-second read
-  timeout. Limits deliberately do not trust client-IP/proxy headers. An attacker
-  can temporarily exhaust capacity/rate windows; put deployment-specific
-  connection/rate limits at the trusted proxy. No automatic eviction of live
-  grants is attempted.
+  timeout. Limits never trust `X-Forwarded-For` or other client-IP/proxy headers.
+  Residual resource DoS remains possible: many clients/callback origins, or
+  requests naming a public client ID, can exhaust table/CPU/network capacity
+  or that client's authorization window. Configure deployment-specific
+  connection/concurrency, request-rate, body-size, and upload-time limits at
+  the trusted proxy (and its trusted source-IP configuration). Application
+  limits are not a substitute for those controls. No automatic eviction of
+  live approved clients or grants is attempted.
 - This is a **single-owner backend**, not multi-user isolation. Approval grants
   all tools on the connected QueryMT instance. `--permission cancel` controls
   agent tool approval, not OAuth scope. Protect the owner secret accordingly.
