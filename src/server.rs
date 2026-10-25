@@ -117,7 +117,7 @@ impl ServerHandler for QmcpServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("qmcp", env!("CARGO_PKG_VERSION")))
-            .with_instructions("Control an existing QueryMT ACP WebSocket server. Discover capabilities, profiles, models, and session ids rather than inventing values. Keep returned sessionId values. Pass cwd for session operations. Timeouts and MCP cancellation do not cancel remote work: check runtime before retrying. Only close sessions when explicitly requested. Streaming ACP events are collected in each tool result.")
+            .with_instructions("Control an existing QueryMT ACP WebSocket server. Discover capabilities, profiles, models, and session ids rather than inventing values. Keep returned sessionId values. For existing sessions, omit cwd to use backend metadata. Choose cwd when creating a session; create a new session to change projects. Timeouts and MCP cancellation do not cancel remote work: check runtime before retrying. Only close sessions when explicitly requested. Events and assistant text are returned in tool results, not streamed live.")
     }
 
     async fn list_tools(
@@ -179,17 +179,7 @@ fn tool_catalog() -> Result<Vec<Tool>> {
             .context("tool must have a description")?;
         let read_only = matches!(
             name.as_str(),
-            "caps"
-                | "profiles"
-                | "models"
-                | "sessions"
-                | "find"
-                | "get_lifecycle"
-                | "inspect"
-                | "status"
-                | "runtime"
-                | "follow"
-                | "watch"
+            "caps" | "profiles" | "sessions" | "find" | "get_lifecycle" | "runtime" | "watch"
         );
         let idempotent = read_only
             || matches!(
@@ -456,6 +446,46 @@ mod tests {
         }
         check("prompt", json!({"new": true, "text": "x", "extra": true}));
         check("caps", json!({"extra": true}));
+    }
+
+    #[test]
+    fn session_guidance_and_schemas_use_backend_cwd_by_default() {
+        let server = QmcpServer::new(
+            BridgeConfig::new(
+                "ws://127.0.0.1:3030/acp/ws",
+                false,
+                PermissionPolicy::Cancel,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(server.get_info().instructions.unwrap().contains("omit cwd"));
+        for name in ["prompt", "status", "inspect", "follow"] {
+            let tool = server.get_tool(name).unwrap();
+            let mut args = json!({"session_id": "existing-session"});
+            if name == "prompt" {
+                args["text"] = json!("continue");
+            }
+            assert!(
+                jsonschema::validator_for(&json!(tool.input_schema))
+                    .unwrap()
+                    .is_valid(&args),
+                "{name}"
+            );
+            assert!(commands::decode(name, args.as_object().unwrap().clone()).is_ok());
+            assert!(
+                tool.input_schema["properties"]["cwd"]["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("backend metadata"),
+                "{name}"
+            );
+        }
+        for name in ["inspect", "status", "follow", "models"] {
+            let annotations = server.get_tool(name).unwrap().annotations.unwrap();
+            assert_eq!(annotations.read_only_hint, Some(false), "{name}");
+            assert_eq!(annotations.idempotent_hint, Some(false), "{name}");
+        }
     }
 
     #[test]

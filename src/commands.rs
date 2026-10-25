@@ -79,7 +79,7 @@ pub enum Command {
     Caps {},
     /// List QueryMT profiles advertised by the server.
     Profiles {},
-    /// List models advertised by the server.
+    /// List models advertised by the server. refresh=true refreshes the backend model catalog.
     Models {
         #[serde(default)]
         refresh: bool,
@@ -89,6 +89,7 @@ pub enum Command {
     /// Create a session without sending a prompt.
     /// To change projects, create a new session with the desired cwd; existing IDs remain unchanged.
     New {
+        /// Project directory on the QueryMT host. Omitted or relative paths use qmcp's process directory.
         cwd: Option<PathBuf>,
         profile: Option<String>,
         mode: Option<String>,
@@ -97,6 +98,7 @@ pub enum Command {
     },
     /// List sessions with ACP pagination and optional lifecycle or pin filters.
     Sessions {
+        /// Optional directory filter; does not change any session's cwd.
         cwd: Option<PathBuf>,
         cursor: Option<String>,
         /// Follow nextCursor until exhausted or the page cap is reached.
@@ -110,6 +112,7 @@ pub enum Command {
     /// Search sessions by title/id/cwd and optionally filter by phase, lifecycle, or pin.
     /// Scans at most 20 pages. Check truncated and scanLimitReached before treating results as exhaustive.
     Find {
+        /// Optional directory filter; does not change any session's cwd.
         cwd: Option<PathBuf>,
         query: Option<String>,
         phase: Option<String>,
@@ -131,9 +134,10 @@ pub enum Command {
     Pin { session_id: String },
     /// Unpin a session.
     Unpin { session_id: String },
-    /// Read compact session history, or the full raw snapshot when full is true.
+    /// Load compact history, or the raw snapshot when full=true. May restore runtime state; replay failures are errors, not empty history.
     Inspect {
         session_id: String,
+        /// Normally omit: resolved from backend metadata. Explicit cwd is a recovery override, not a project switch.
         cwd: Option<PathBuf>,
         #[serde(default)]
         full: bool,
@@ -141,16 +145,17 @@ pub enum Command {
         #[serde(default = "default_true")]
         tools: bool,
     },
-    /// Current mode/model/profile/effort for a session.
+    /// Load/resume current mode/model/profile/effort for a session. May restore runtime state.
     Status {
         session_id: String,
+        /// Normally omit: resolved from backend metadata. Explicit cwd is a recovery override, not a project switch.
         cwd: Option<PathBuf>,
     },
-    /// Set session mode (build, plan, or review).
+    /// Set a mode ID supported by the session.
     SetMode { session_id: String, mode: String },
     /// Set session model id. Discover valid ids with models.
     SetModel { session_id: String, model: String },
-    /// Set reasoning effort (auto, low, medium, high, or max).
+    /// Set a reasoning-effort value supported by the session.
     SetEffort { session_id: String, effort: String },
     /// Send text to a session, or create one with new=true. Auto delivery prompts when idle, steers when possible, otherwise queues.
     Prompt {
@@ -159,7 +164,10 @@ pub enum Command {
         session_id: Option<String>,
         /// Literal prompt text. Stdin is reserved for the MCP protocol.
         text: String,
+        /// Existing session: omit to use backend metadata. New session: choose a project; omitted or relative paths use qmcp's process directory.
+        /// Explicit cwd on an existing session is a recovery override, not a project switch; queue/steer delivery does not use cwd.
         cwd: Option<PathBuf>,
+        /// Profile used only when new=true.
         profile: Option<String>,
         mode: Option<String>,
         model: Option<String>,
@@ -175,9 +183,10 @@ pub enum Command {
     },
     /// Current QueryMT runtime state for a session.
     Runtime { session_id: String },
-    /// Collect compact session events until idle. Supply cwd for the session workspace.
+    /// Load/resume a session and collect compact events until idle. May restore runtime state.
     Follow {
         session_id: String,
+        /// Normally omit: resolved from backend metadata. Explicit cwd is a recovery override, not a project switch.
         cwd: Option<PathBuf>,
         #[serde(default = "default_interval")]
         interval: u64,

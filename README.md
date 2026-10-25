@@ -20,7 +20,6 @@ cargo install --locked --path .
 
 ## Connect
 
-
 See [How to connect](docs/how-to-connect.md) for local stdio, Bearer over HTTPS,
 private tunnels, and OAuth/ChatGPT setup. The guide includes client examples,
 authentication requirements, and remote-access precautions.
@@ -43,10 +42,14 @@ Start with `caps`, `profiles`, and `models` to discover available capabilities.
 | `cancel`, `close` | Request turn cancellation or explicitly close a session |
 | `exec` | Run a batch sequentially on one ACP connection |
 
-Use `prompt` with `new: true` to start a session, then its returned `sessionId`
-as `session_id` to continue. Pass an explicit `cwd` for workspace operations;
-paths refer to the QueryMT host. `profiles`, `models`, lifecycle, and pin tools
-return provider data under `result`, separate from bridge status and event metadata.
+Choose a project with `new` or `prompt(new: true)`, then reuse its returned
+`sessionId` as `session_id`. For existing sessions, omit `cwd`: qmcp resolves it
+from backend metadata. Create a new session to change projects. An explicit cwd
+is only a recovery override when metadata is unavailable, not a project switch.
+Paths refer to the QueryMT host; use absolute paths for remote backends, since
+omitted/relative cwd on creation uses qmcp's process directory. `profiles`,
+`models`, lifecycle, and pin tools return provider data under `result`, separate
+from bridge status and event metadata.
 
 ## Important Behavior
 
@@ -63,6 +66,9 @@ return provider data under `result`, separate from bridge status and event metad
   returns after submission when either is selected; idle prompt delivery still waits.
 - A receipt confirms acceptance, not task success. Check `observationState`;
   invalid receipts fail and keep submission recovery unconfirmed.
+- `inspect`, `status`, and `follow` can load/resume sessions and restore runtime
+  state; they are not read-only APIs. `inspect` and `follow` report history replay
+  failures as errors, not empty history.
 - Events and assistant text are returned with the result, not streamed live.
   Check `droppedEvents` and `textTruncated` for incomplete output.
 - `find` scans at most 20 pages. Check `truncated` and `scanLimitReached` before

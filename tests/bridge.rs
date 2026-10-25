@@ -394,6 +394,12 @@ impl Mcp {
         };
         let initialized = mcp.rpc("initialize", json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "fixture-client", "version": "1"}})).await;
         assert_eq!(initialized["serverInfo"]["name"], "qmcp");
+        assert!(
+            initialized["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("omit cwd")
+        );
         mcp.message(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
             .await;
         mcp

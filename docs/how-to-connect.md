@@ -7,7 +7,7 @@
 | [Local stdio](#local-stdio) | Desktop and CLI MCP clients | Local process permissions |
 | [Bearer over HTTPS](#bearer-over-https) | Clients with custom authorization headers | Shared token |
 | [Private tunnel](#private-tunnel-chatgpt) | ChatGPT without a public endpoint | OpenAI tunnel access |
-| [OAuth over HTTPS](#oauth-over-https-chatgpt) | Public authenticated ChatGPT connections | External OAuth provider |
+| [OAuth over HTTPS](#oauth-over-https-chatgpt) | Public authenticated ChatGPT connections | Embedded or external OAuth |
 
 Bearer and OAuth are HTTP authentication modes. The tunnel privately connects
 ChatGPT to qmcp over stdio; it is not another MCP transport.
@@ -94,10 +94,22 @@ to keep qmcp private. Your account/workspace must allow tunnels and custom MCP s
 
 ## OAuth over HTTPS (ChatGPT)
 
+For embedded single-owner OAuth, run `qmcp --transport http --oauth-local-config
+local-oauth.json` behind an HTTPS proxy. The JSON fields are `resource` (the public
+HTTPS `/mcp` URL), `client_id` (a preconfigured public client), `redirect_uri`
+(the client's exact HTTPS callback), and `owner_secret_file`. The secret must be
+32 random bytes encoded as 64 hex characters in a private regular file with mode
+`0600`; embedded OAuth requires Unix. Forward `/mcp`, `/oauth/*`, and
+`/.well-known/*`. Only owner consent accepts the same-origin browser POST.
+Tokens are in-memory; restart requires reauthorization. Dynamic registration is
+not supported. Live ChatGPT sign-in has not been verified.
+
+### External provider
+
 Use an external [OAuth provider](https://developers.openai.com/plugins/build/auth)
 with authorization-code + PKCE (`S256`) and ChatGPT client registration
-(pre-registered, CIMD, or DCR). qmcp provides discovery and token introspection;
-the provider handles login, consent, token issuance, and revocation.
+(pre-registered, CIMD, or DCR). In this mode, qmcp provides discovery and token
+introspection; the provider handles login, consent, token issuance, and revocation.
 
 Create `oauth.json` with your actual provider values:
 
@@ -140,9 +152,11 @@ configuration and has not been verified by the project's mock-provider tests.
 
 - Use HTTPS: qmcp itself does not terminate TLS. Never send tokens over public plaintext HTTP.
 - Keep qmcp's backend port private to the proxy with a firewall/private network.
-- Forward Authorization and an allowed Host. Browser Origin headers are rejected.
-- Non-loopback binds require Bearer or OAuth auth. Wildcard binds also require
-  explicit `--allowed-host` values (repeatable, optionally `host:port`).
+- Forward Authorization and an allowed Host. MCP requests reject browser Origin
+  headers; embedded OAuth consent accepts only its own public origin.
+- Non-loopback binds require Bearer or OAuth auth. Wildcard binds require allowed
+  hosts; OAuth adds its configured resource host automatically. Use `--allowed-host`
+  for additional hosts (repeatable, optionally `host:port`).
 - Use `--bind` only when the proxy needs another interface. Keep the default
   loopback listener when the proxy runs on the same host.
 - `--permission` controls QueryMT tool approval, not MCP client authentication.
