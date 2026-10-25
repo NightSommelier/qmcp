@@ -47,16 +47,12 @@ struct Cli {
         long,
         env = "QMCP_BEARER_TOKEN",
         hide_env_values = true,
-        conflicts_with_all = ["oauth_config", "oauth_local_resource"]
+        conflicts_with = "oauth_config"
     )]
     bearer_token: Option<String>,
 
     /// OAuth resource/provider JSON configuration (HTTP only; see README).
-    #[arg(
-        long,
-        requires = "oauth_client_secret",
-        conflicts_with = "oauth_local_resource"
-    )]
+    #[arg(long, requires = "oauth_client_secret")]
     oauth_config: Option<PathBuf>,
 
     /// Introspection client secret. Prefer the environment variable.
@@ -68,38 +64,18 @@ struct Cli {
     )]
     oauth_client_secret: Option<String>,
 
-    /// Embedded single-owner OAuth resource: canonical public HTTPS /mcp URL (HTTP only).
-    #[arg(long, requires = "oauth_owner_secret_file", conflicts_with_all = ["oauth_config", "bearer_token"])]
-    oauth_local_resource: Option<String>,
-
-    /// Absolute path to a generated owner credential, private regular file mode 0600.
-    #[arg(long, requires = "oauth_local_resource")]
-    oauth_owner_secret_file: Option<PathBuf>,
+    /// Embedded single-owner OAuth JSON: resource, client_id, redirect_uri, owner_secret_file.
+    #[arg(long, conflicts_with_all = ["bearer_token", "oauth_config", "oauth_client_secret"])]
+    oauth_local_config: Option<PathBuf>,
 
     /// Additional allowed HTTP hostname or host:port (repeatable; requires auth).
     #[arg(long = "allowed-host", action = clap::ArgAction::Append)]
     allowed_hosts: Vec<String>,
 }
 
-impl Cli {
-    fn validate(&self) -> Result<()> {
-        if matches!(self.transport, Transport::Stdio)
-            && (self.bearer_token.is_some()
-                || self.oauth_config.is_some()
-                || self.oauth_local_resource.is_some()
-                || self.oauth_owner_secret_file.is_some()
-                || !self.allowed_hosts.is_empty())
-        {
-            bail!("HTTP authentication options require --transport http");
-        }
-        Ok(())
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    cli.validate()?;
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
@@ -113,17 +89,28 @@ async fn main() -> Result<()> {
         cli.permission,
     )?)?;
     match cli.transport {
-        Transport::Stdio => transport::serve_stdio(server).await,
+        Transport::Stdio => {
+            if cli.bearer_token.is_some()
+                || cli.oauth_config.is_some()
+                || cli.oauth_local_config.is_some()
+                || !cli.allowed_hosts.is_empty()
+            {
+                bail!("HTTP authentication options require --transport http");
+            }
+            transport::serve_stdio(server).await
+        }
         Transport::Http => {
             let token = cli
                 .bearer_token
                 .map(|value| transport::BearerToken::new(&value))
                 .transpose()?;
-            let router = if let Some(resource) = cli.oauth_local_resource {
-                let path = cli
-                    .oauth_owner_secret_file
-                    .context("owner secret file is required")?;
-                let auth = qmcp::local_oauth::LocalOAuth::from_secret_file(&resource, &path)?;
+            let router = if let Some(path) = cli.oauth_local_config {
+                let bytes = tokio::fs::read(path)
+                    .await
+                    .context("read embedded OAuth configuration")?;
+                let config =
+                    serde_json::from_slice(&bytes).context("parse embedded OAuth configuration")?;
+                let auth = qmcp::local_oauth::LocalOAuth::from_config(config)?;
                 transport::http_router_with_local_oauth(server, cli.bind, auth, &cli.allowed_hosts)?
             } else if let Some(path) = cli.oauth_config {
                 let bytes = tokio::fs::read(path)
@@ -188,40 +175,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn embedded_oauth_rejects_orphan_conflicting_and_stdio_options() {
-        let local = [
-            "--oauth-local-resource",
-            "https://mcp.example.com/mcp",
-            "--oauth-owner-secret-file",
-            "/example/owner-secret",
-        ];
-        for suffix in [
-            vec!["--bearer-token", "test-static-token"],
+    fn embedded_oauth_is_explicit_and_conflicts_with_other_auth_modes() {
+        assert!(
+            Cli::try_parse_from([
+                "qmcp",
+                "--transport",
+                "http",
+                "--oauth-local-config",
+                "local.json"
+            ])
+            .is_ok()
+        );
+        for extra in [
+            vec!["--bearer-token", "test-token"],
             vec![
                 "--oauth-config",
-                "oauth.json",
+                "external.json",
                 "--oauth-client-secret",
-                "test-provider-secret",
+                "test-secret",
             ],
         ] {
-            let args: Vec<_> =
-                [vec!["qmcp", "--transport", "http"], local.to_vec(), suffix].concat();
-            assert!(Cli::try_parse_from(args).is_err());
-        }
-        for args in [
-            vec!["qmcp", "--oauth-owner-secret-file", "/example/owner-secret"],
-            vec![
+            let mut args = vec![
                 "qmcp",
-                "--oauth-local-resource",
-                "https://mcp.example.com/mcp",
-            ],
-        ] {
+                "--transport",
+                "http",
+                "--oauth-local-config",
+                "local.json",
+            ];
+            args.extend(extra);
             assert!(Cli::try_parse_from(args).is_err());
         }
-        let args = [vec!["qmcp"], local.to_vec()].concat();
-        assert!(Cli::try_parse_from(args).unwrap().validate().is_err());
-        let args = [vec!["qmcp", "--transport", "http"], local.to_vec()].concat();
-        assert!(Cli::try_parse_from(args).unwrap().validate().is_ok());
     }
 
     #[test]
