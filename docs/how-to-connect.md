@@ -25,6 +25,66 @@ qmcp connects to `ws://127.0.0.1:3030/acp/ws` by default. Change it with `--url`
 or `QMCP_ACP_URL`. Prefer `wss://` for remote ACP connections; plaintext
 non-loopback ACP requires `--allow-insecure`. qmcp does not launch QueryMT.
 
+## Select a Session Workspace
+
+After connecting using any transport, use `workspace` to choose a directory on
+**the QueryMT host** without sending a prompt. There is no chat-global active cwd;
+the returned `sessionId` is the explicit handle for later calls.
+
+```text
+workspace({"cwd":"/srv/projects/app"})
+  -> {"sessionId":"A","cwd":"/srv/projects/app","created":true,"switched":false,...}
+prompt({"session_id":"A","text":"Describe the project"})
+status({"session_id":"A"})
+inspect({"session_id":"A"})
+workspace({"session_id":"A","cwd":"../other"})
+  -> {"sessionId":"B","previousSessionId":"A","cwd":"/srv/projects/other","created":true,"switched":true,...}
+prompt({"session_id":"B","text":"Use this project now"})
+```
+
+Always keep and use the returned **new ID** after a switch. QueryMT does not
+reliably rebind a materialized session, so changing directories creates a new
+backend session. The old session stays unchanged, with no implicit close, cancel,
+or ID alias. Omitted cwd or an equivalent normalized path selects the same ID
+with `created:false, switched:false`. Continuing `prompt` with a different cwd
+has the same new-session behavior and returns `previousSessionId` too.
+Read-only `status`, `inspect`, and `follow` remember cwd when omitted and reject
+explicit different cwd, suggesting `workspace`; they never create a session.
+
+`workspace` without an ID requires cwd. `new` and `prompt(new=true)` also pin cwd
+immediately on acknowledgement, even when later configuration fails. They retain
+qmcp's startup-directory default if cwd is omitted. Initial/new relative paths
+resolve from the once-captured qmcp startup cwd; relative paths with an existing
+ID resolve from that session's cwd. Prefer absolute paths for remote QueryMT.
+Normalization is lexical POSIX `.`/`..` processing, not a local filesystem check
+or symlink resolution. `~` is rejected: supply an absolute backend home path
+instead. Empty/control-character and Windows drive/UNC paths are rejected too.
+The backend validates paths; workspace selection is not a sandbox or allowlist.
+
+Optionally supply `profile` on creation (discover IDs with `profiles`). Switches
+inherit a known profile selected at creation or reported by backend list metadata.
+If unknown, the backend default is used and the result explicitly reports
+`profileKnown:false`, `profileSource:"backend-default-unknown"`. A same-workspace
+explicit different/unknown profile is rejected; profile changing is not part of
+workspace selection. Start without an ID to select a new profile independently.
+
+Bindings live in qmcp memory (4096 IDs, no eviction), shared by all server clones,
+HTTP requests, and sequential `exec` steps. Closing a session retains its binding
+for resume. Unknown IDs and IDs after qmcp restart require authoritative cwd from
+unfiltered paginated `session/list`, at most 20 pages with repeated-cursor detection.
+No history is loaded before cwd is known. Unsupported/missing cwd metadata,
+not-found sessions, and incomplete scans produce distinct fail-closed errors,
+not guessed paths or implicit sessions, even with explicit caller cwd. Accurate
+backend metadata is required; cached lexical bindings cannot detect external
+workspace changes or symlink equivalence. No locks span network operations, so
+long prompts do not block session-ID-only runtime/steer/cancel calls.
+
+Check `recovery` on failures/timeouts before retrying; acknowledged new IDs remain
+usable without cwd. A creation whose acknowledgement never arrives may still
+exist remotely but has no locally known ID. Cancellation/disconnect does not
+implicitly cancel or close remote work. This feature does not alter or deploy
+the running QueryMT service or change global backend configuration.
+
 ## Local stdio
 
 Configure your MCP client to launch qmcp:

@@ -2,6 +2,7 @@
 
 mod commands;
 mod output;
+mod workspace;
 
 pub use qmacp::policy;
 

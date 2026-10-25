@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     path::PathBuf,
     process::Stdio,
     sync::{
@@ -16,6 +17,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
     net::{TcpListener, TcpStream},
     process::{Child, ChildStdin, ChildStdout},
+    sync::oneshot,
     task::{JoinHandle, JoinSet},
 };
 use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
@@ -25,6 +27,21 @@ struct MockAcp {
     requests: Arc<Mutex<Vec<Value>>>,
     active: Arc<AtomicUsize>,
     task: JoinHandle<()>,
+    workspace: Arc<Mutex<MockWorkspace>>,
+}
+
+#[derive(Default)]
+struct MockWorkspace {
+    created: Vec<Value>,
+    listing: Option<Vec<Value>>,
+    reject_creation: bool,
+    forced_id: Option<String>,
+    creation_gates: VecDeque<CreationGate>,
+}
+
+struct CreationGate {
+    observed: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -74,6 +91,8 @@ impl MockAcp {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let active = Arc::new(AtomicUsize::new(0));
         let recorded = requests.clone();
+        let workspace = Arc::new(Mutex::new(MockWorkspace::default()));
+        let workspaces = workspace.clone();
         let connections = active.clone();
         let task = tokio::spawn(async move {
             let mut tasks = JoinSet::new();
@@ -84,12 +103,13 @@ impl MockAcp {
                         let recorded = recorded.clone();
                         let active = connections.clone();
                         let payload = extension_payload.clone();
+                        let workspace = workspaces.clone();
                         tasks.spawn(async move {
                             active.fetch_add(1, Ordering::SeqCst);
                             let _guard = ConnectionGuard(active);
                             tokio::time::sleep(delay).await;
                             let socket = accept_async(stream).await.unwrap();
-                            serve_acp(socket, recorded, behavior, listing_pages, payload).await;
+                            serve_acp(socket, recorded, behavior, listing_pages, payload, workspace).await;
                         });
                     }
                     Some(result) = tasks.join_next(), if !tasks.is_empty() => { result.unwrap(); }
@@ -101,6 +121,7 @@ impl MockAcp {
             requests,
             active,
             task,
+            workspace,
         }
     }
 
@@ -144,6 +165,7 @@ async fn serve_acp(
     behavior: SubmissionBehavior,
     listing_pages: Option<usize>,
     extension_payload: Option<Value>,
+    workspace: Arc<Mutex<MockWorkspace>>,
 ) {
     let mut submitted = false;
     while let Some(Ok(message)) = socket.next().await {
@@ -177,6 +199,38 @@ async fn serve_acp(
             .await;
             continue;
         }
+        if method == "session/new" && workspace.lock().unwrap().reject_creation {
+            send(&mut socket, json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32000, "message": "creation rejected"}})).await;
+            continue;
+        }
+        if method == "session/list" {
+            let listing = workspace.lock().unwrap().listing.clone();
+            if let Some(pages) = listing {
+                assert!(
+                    params.get("cwd").is_none(),
+                    "workspace discovery must be unfiltered"
+                );
+                assert!(
+                    params.get("_meta").is_none(),
+                    "workspace discovery must include all lifecycles"
+                );
+                let page = params["cursor"]
+                    .as_str()
+                    .and_then(|cursor| cursor.strip_prefix("page-"))
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .unwrap_or(1)
+                    - 1;
+                let reply = &pages[page.min(pages.len() - 1)];
+                let mut response = json!({"jsonrpc": "2.0", "id": id});
+                response[if reply.get("error").is_some() {
+                    "error"
+                } else {
+                    "result"
+                }] = reply.get("error").unwrap_or(reply).clone();
+                send(&mut socket, response).await;
+                continue;
+            }
+        }
         let result = match method {
             "initialize" => {
                 json!({"protocolVersion": 1, "agentInfo": {"name": "fixture", "version": "1"}, "agentCapabilities": {"loadSession": true, "sessionCapabilities": {"list": {}, "resume": {}, "close": {}}}})
@@ -185,7 +239,20 @@ async fn serve_acp(
                 json!({"features": {"session_lifecycle": true, "session_pins": true}, "methods": ["querymt/session/getLifecycle", "querymt/session/setLifecycle", "querymt/session/setPinned"]})
             }
             "_querymt/profiles" => json!({"profiles": [{"id": "fixture-profile"}]}),
-            "session/new" => json!({"sessionId": "fixture-session"}),
+            "session/new" => {
+                let mut workspace = workspace.lock().unwrap();
+                let number = workspace.created.len() + 1;
+                let session_id = workspace.forced_id.clone().unwrap_or_else(|| {
+                    if number == 1 {
+                        "fixture-session".to_owned()
+                    } else {
+                        format!("fixture-session-{number}")
+                    }
+                });
+                workspace.created.push(json!({"sessionId": session_id, "cwd": params["cwd"], "_meta": params["_meta"]}));
+                json!({"sessionId": session_id})
+            }
+            "session/close" => json!({}),
             "session/resume" | "session/load" => {
                 json!({"configOptions": [{"id": "model", "name": "Model", "type": "select", "currentValue": "fixture-model", "options": [{"value": "fixture-model", "name": "Fixture"}]}]})
             }
@@ -210,7 +277,8 @@ async fn serve_acp(
                 } else if params["cursor"] == "page-2" {
                     json!({"sessions": [{"sessionId": "second-session", "cwd": "/workspace", "title": "Second"}]})
                 } else {
-                    json!({"sessions": [{"sessionId": "fixture-session", "cwd": "/workspace", "title": "Fixture"}], "nextCursor": "page-2"})
+                    let created = workspace.lock().unwrap().created.clone();
+                    json!({"sessions": if created.is_empty() { vec![json!({"sessionId": "fixture-session", "cwd": "/workspace", "title": "Fixture"})] } else { created }, "nextCursor": "page-2"})
                 }
             }
             "_querymt/session/runtimeState" => {
@@ -247,7 +315,7 @@ async fn serve_acp(
                     continue;
                 }
                 let permission = acp::RequestPermissionRequest::new(
-                    "fixture-session",
+                    params["sessionId"].as_str().unwrap().to_owned(),
                     acp::ToolCallUpdate::new("tool-1", acp::ToolCallUpdateFields::new()),
                     vec![acp::PermissionOption::new(
                         "allow",
@@ -267,7 +335,7 @@ async fn serve_acp(
                 } else {
                     format!("reply:{text}")
                 };
-                send(&mut socket, json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "fixture-session", "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": reply}}}})).await;
+                send(&mut socket, json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": params["sessionId"], "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": reply}}}})).await;
                 json!({"stopReason": if text == "cancelled" { "cancelled" } else { "end_turn" }})
             }
             _ => {
@@ -275,6 +343,13 @@ async fn serve_acp(
                 continue;
             }
         };
+        if method == "session/new" {
+            let gate = workspace.lock().unwrap().creation_gates.pop_front();
+            if let Some(gate) = gate {
+                gate.observed.send(()).unwrap();
+                gate.release.await.unwrap();
+            }
+        }
         send(
             &mut socket,
             json!({"jsonrpc": "2.0", "id": id, "result": result}),
@@ -427,11 +502,797 @@ impl Drop for Mcp {
     }
 }
 
+#[tokio::test]
+async fn workspace_is_sticky_across_calls_and_switches_without_touching_old_sessions() {
+    for http in [false, true] {
+        let backend = MockAcp::start().await;
+        let mut mcp = Mcp::start(&backend.url, http).await;
+        let missing = mcp.tool("workspace", json!({})).await;
+        assert_eq!(missing["isError"], true);
+        assert!(backend.recorded().is_empty());
+        let created = mcp.tool("workspace", json!({"cwd": "/remote/not-on-qmcp/project/./sub/..", "profile": "fixture-profile"})).await;
+        assert_eq!(created["isError"], false, "{created}");
+        let first = created["structuredContent"]["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(created["structuredContent"]["created"], true);
+        assert_eq!(created["structuredContent"]["switched"], false);
+        assert_eq!(
+            created["structuredContent"]["cwd"],
+            "/remote/not-on-qmcp/project"
+        );
+        assert!(
+            !backend
+                .recorded()
+                .iter()
+                .any(|r| r["method"] == "session/prompt")
+        );
+        for cwd in [
+            None,
+            Some("."),
+            Some("sub/.."),
+            Some("/remote/not-on-qmcp/project"),
+        ] {
+            let mut args = json!({"session_id": first, "profile": "fixture-profile"});
+            if let Some(cwd) = cwd {
+                args["cwd"] = json!(cwd);
+            }
+            let selected = mcp.tool("workspace", args).await;
+            assert_eq!(selected["isError"], false, "{selected}");
+            assert_eq!(selected["structuredContent"]["sessionId"], first);
+            assert_eq!(selected["structuredContent"]["created"], false);
+            assert_eq!(selected["structuredContent"]["switched"], false);
+        }
+        let mismatch = mcp
+            .tool(
+                "workspace",
+                json!({"session_id": first, "profile": "other"}),
+            )
+            .await;
+        assert_eq!(mismatch["isError"], true);
+        assert!(
+            mismatch["structuredContent"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("profile changes")
+        );
+        let prompted = mcp
+            .tool("prompt", json!({"session_id": first, "text": "continue"}))
+            .await;
+        assert_eq!(prompted["isError"], false, "{prompted}");
+        assert_eq!(prompted["structuredContent"]["sessionId"], first);
+        assert_eq!(
+            prompted["structuredContent"]["cwd"],
+            "/remote/not-on-qmcp/project"
+        );
+        for name in ["status", "inspect", "follow"] {
+            let result = mcp.tool(name, json!({"session_id": first})).await;
+            assert_eq!(result["isError"], false, "{name}: {result}");
+            assert_eq!(
+                result["structuredContent"]["cwd"],
+                "/remote/not-on-qmcp/project"
+            );
+            let before = backend.recorded().len();
+            let rejected = mcp
+                .tool(name, json!({"session_id": first, "cwd": "/wrong"}))
+                .await;
+            assert_eq!(rejected["isError"], true, "{name}: {rejected}");
+            assert!(
+                rejected["structuredContent"]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("use workspace")
+            );
+            assert!(!backend.recorded()[before..].iter().any(|r| matches!(
+                r["method"].as_str(),
+                Some("session/load" | "session/resume" | "session/new")
+            )));
+        }
+        let switched = mcp
+            .tool("workspace", json!({"session_id": first, "cwd": "../other"}))
+            .await;
+        assert_eq!(switched["isError"], false, "{switched}");
+        let second = switched["structuredContent"]["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(first, second);
+        assert_eq!(switched["structuredContent"]["previousSessionId"], first);
+        assert_eq!(
+            switched["structuredContent"]["cwd"],
+            "/remote/not-on-qmcp/other"
+        );
+        assert_eq!(switched["structuredContent"]["created"], true);
+        assert_eq!(switched["structuredContent"]["switched"], true);
+        assert_eq!(switched["structuredContent"]["profileSource"], "inherited");
+        let switched_prompt = mcp
+            .tool(
+                "prompt",
+                json!({"session_id": second, "cwd": "../third", "text": "switch"}),
+            )
+            .await;
+        assert_eq!(switched_prompt["isError"], false, "{switched_prompt}");
+        let third = switched_prompt["structuredContent"]["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(third, second);
+        assert_eq!(
+            switched_prompt["structuredContent"]["previousSessionId"],
+            second
+        );
+        assert_eq!(switched_prompt["structuredContent"]["created"], true);
+        assert_eq!(
+            switched_prompt["structuredContent"]["cwd"],
+            "/remote/not-on-qmcp/third"
+        );
+        for (id, cwd) in [
+            (&first, "/remote/not-on-qmcp/project"),
+            (&second, "/remote/not-on-qmcp/other"),
+            (&third, "/remote/not-on-qmcp/third"),
+        ] {
+            let status = mcp.tool("status", json!({"session_id": id})).await;
+            assert_eq!(status["isError"], false);
+            assert_eq!(status["structuredContent"]["cwd"], cwd);
+        }
+        let requests = backend.recorded();
+        let creations: Vec<_> = requests
+            .iter()
+            .filter(|r| r["method"] == "session/new")
+            .collect();
+        assert_eq!(creations.len(), 3);
+        for request in creations {
+            assert_eq!(
+                request["params"]["_meta"]["querymt"]["profile_id"],
+                "fixture-profile"
+            );
+        }
+        assert!(!requests.iter().any(|r| r["method"] == "session/list"));
+        assert_no_implicit_cancel(&backend);
+    }
+}
+
+#[tokio::test]
+async fn workspace_metadata_recovery_is_unfiltered_paginated_and_never_trusts_caller_cwd() {
+    let backend = MockAcp::start().await;
+    backend.workspace.lock().unwrap().listing = Some(vec![
+        json!({"sessions": [{"sessionId": "unrelated", "cwd": "/unrelated"}], "nextCursor": "page-2"}),
+        json!({"sessions": [{"sessionId": "old", "cwd": "/remote/original/./project", "_meta": {"querymt": {"profile_id": "listed-profile"}}}]}),
+    ]);
+    // Separate qmcp instances simulate losing all process-local bindings.
+    for http in [false, true] {
+        let mut mcp = Mcp::start(&backend.url, http).await;
+        let rejected = mcp
+            .tool(
+                "status",
+                json!({"session_id": "old", "cwd": "/requested/not-authoritative"}),
+            )
+            .await;
+        assert_eq!(rejected["isError"], true, "{rejected}");
+        let selected = mcp.tool("workspace", json!({"session_id": "old"})).await;
+        assert_eq!(selected["isError"], false, "{selected}");
+        assert_eq!(
+            selected["structuredContent"]["cwd"],
+            "/remote/original/project"
+        );
+        assert_eq!(selected["structuredContent"]["profile"], "listed-profile");
+        let switched = mcp
+            .tool(
+                "prompt",
+                json!({"session_id": "old", "cwd": "../next", "text": "new workspace"}),
+            )
+            .await;
+        assert_eq!(switched["isError"], false, "{switched}");
+        assert_eq!(switched["structuredContent"]["previousSessionId"], "old");
+        assert_eq!(
+            switched["structuredContent"]["cwd"],
+            "/remote/original/next"
+        );
+        assert_eq!(switched["structuredContent"]["profileSource"], "inherited");
+        let old = mcp.tool("status", json!({"session_id": "old"})).await;
+        assert_eq!(old["structuredContent"]["cwd"], "/remote/original/project");
+    }
+    let requests = backend.recorded();
+    let listing: Vec<_> = requests
+        .iter()
+        .filter(|r| r["method"] == "session/list")
+        .collect();
+    assert_eq!(listing.len(), 4);
+    for page in listing {
+        assert!(page["params"].get("cwd").is_none());
+        assert!(page["params"].get("_meta").is_none());
+    }
+    for request in requests.iter().filter(|r| {
+        matches!(
+            r["method"].as_str(),
+            Some("session/load" | "session/resume")
+        )
+    }) {
+        assert_eq!(request["params"]["sessionId"], "old");
+        assert_eq!(request["params"]["cwd"], "/remote/original/project");
+    }
+    assert_no_implicit_cancel(&backend);
+}
+
+#[tokio::test]
+async fn workspace_discovery_fails_closed_for_incomplete_or_unavailable_metadata() {
+    let cases = [
+        (vec![json!({"sessions": []})], "not found"),
+        (
+            vec![json!({"sessions": [], "nextCursor": null})],
+            "not found",
+        ),
+        (
+            vec![json!({"sessions": [], "nextCursor": 17})],
+            "metadata unavailable",
+        ),
+        (
+            vec![json!({"sessions": [], "nextCursor": true})],
+            "metadata unavailable",
+        ),
+        (
+            vec![json!({"sessions": [], "nextCursor": {}})],
+            "metadata unavailable",
+        ),
+        (
+            vec![json!({"sessions": [], "nextCursor": []})],
+            "metadata unavailable",
+        ),
+        (
+            vec![json!({"sessions": [], "nextCursor": ""})],
+            "repeated a cursor",
+        ),
+        (
+            vec![
+                json!({"sessions": [], "nextCursor": "page-2"}),
+                json!({"sessions": [], "nextCursor": "page-2"}),
+            ],
+            "repeated a cursor",
+        ),
+        (
+            vec![json!({"sessions": [{"sessionId": "unknown", "cwd": ""}]})],
+            "missing or not absolute",
+        ),
+        (
+            vec![json!({"sessions": [{"sessionId": "unknown", "cwd": "relative"}]})],
+            "missing or not absolute",
+        ),
+        (
+            vec![json!({"sessions": [{"sessionId": "unknown"}]})],
+            "metadata unavailable",
+        ),
+        (
+            vec![json!({"error": {"code": -32601, "message": "list unsupported"}})],
+            "metadata unavailable",
+        ),
+        (
+            (1..=20)
+                .map(|page| json!({"sessions": [], "nextCursor": format!("page-{}", page + 1)}))
+                .collect(),
+            "page cap reached",
+        ),
+    ];
+    for (pages, expected) in cases {
+        for name in ["workspace", "prompt", "status", "inspect", "follow"] {
+            let backend = MockAcp::start().await;
+            backend.workspace.lock().unwrap().listing = Some(pages.clone());
+            let mut mcp = Mcp::start(&backend.url, true).await;
+            let mut args = json!({"session_id": "unknown", "cwd": "/caller/cannot/prove/this"});
+            if name == "prompt" {
+                args["text"] = json!("must not send");
+            }
+            let result = mcp.tool(name, args).await;
+            assert_eq!(result["isError"], true, "{name}: {result}");
+            assert!(
+                result["structuredContent"]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains(expected),
+                "{expected}: {result}"
+            );
+            if expected == "metadata unavailable" {
+                assert!(
+                    !result["structuredContent"]["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("not found")
+                );
+            }
+            assert!(!backend.recorded().iter().any(|r| matches!(
+                r["method"].as_str(),
+                Some("session/new" | "session/load" | "session/resume" | "session/prompt")
+            )));
+            assert_no_implicit_cancel(&backend);
+        }
+    }
+}
+
+#[tokio::test]
+async fn workspace_profile_unknown_is_explicit_and_paths_are_remote_lexical() {
+    let backend = MockAcp::start().await;
+    let mut mcp = Mcp::start(&backend.url, true).await;
+    for cwd in [
+        "~",
+        "~/project",
+        "~user/project",
+        "",
+        "C:",
+        "C:/project",
+        "/bad\npath",
+    ] {
+        let result = mcp.tool("workspace", json!({"cwd": cwd})).await;
+        assert_eq!(result["isError"], true, "{cwd:?}: {result}");
+    }
+    assert!(
+        !backend
+            .recorded()
+            .iter()
+            .any(|r| r["method"] == "session/new")
+    );
+    let selected = mcp
+        .tool("workspace", json!({"session_id": "fixture-session"}))
+        .await;
+    assert_eq!(selected["isError"], false, "{selected}");
+    assert_eq!(selected["structuredContent"]["profileKnown"], false);
+    let rejected = mcp
+        .tool(
+            "workspace",
+            json!({"session_id": "fixture-session", "profile": "cannot-assume"}),
+        )
+        .await;
+    assert_eq!(rejected["isError"], true);
+    // Give session/new a genuinely fresh ID in this fixture, whose default list
+    // already contains fixture-session (normal new-session tests start empty).
+    backend
+        .workspace
+        .lock()
+        .unwrap()
+        .created
+        .push(json!({"sessionId": "fixture-session", "cwd": "/workspace"}));
+    let switched = mcp
+        .tool(
+            "workspace",
+            json!({"session_id": "fixture-session", "cwd": "/remote/nonexistent"}),
+        )
+        .await;
+    assert_eq!(switched["isError"], false, "{switched}");
+    assert_eq!(
+        switched["structuredContent"]["profileSource"],
+        "backend-default-unknown"
+    );
+    assert_eq!(switched["structuredContent"]["profileKnown"], false);
+    let known = mcp.tool("workspace", json!({"session_id": "fixture-session-2", "cwd": "/other", "profile": "explicit-profile"})).await;
+    assert_eq!(known["isError"], false, "{known}");
+    assert_eq!(known["structuredContent"]["profile"], "explicit-profile");
+    assert_eq!(known["structuredContent"]["profileSource"], "explicit");
+    let requests = backend.recorded();
+    let new: Vec<_> = requests
+        .iter()
+        .filter(|r| r["method"] == "session/new")
+        .collect();
+    assert!(new[0]["params"].get("_meta").is_none());
+    assert_eq!(
+        new[1]["params"]["_meta"]["querymt"]["profile_id"],
+        "explicit-profile"
+    );
+    assert_no_implicit_cancel(&backend);
+}
+
+#[tokio::test]
+async fn workspace_batches_and_close_keep_bindings_and_new_commands_register_immediately() {
+    for http in [false, true] {
+        for name in ["new", "prompt"] {
+            let backend = MockAcp::start().await;
+            let mut mcp = Mcp::start(&backend.url, http).await;
+            let mut args = json!({"cwd": "/remote/partial", "mode": "invalid"});
+            if name == "prompt" {
+                args["new"] = json!(true);
+                args["text"] = json!("not sent");
+            }
+            let failed = mcp.tool(name, args).await;
+            assert_eq!(failed["isError"], true, "{failed}");
+            assert_eq!(
+                failed["structuredContent"]["recovery"]["sessionCreated"],
+                true
+            );
+            let status = mcp
+                .tool("status", json!({"session_id": "fixture-session"}))
+                .await;
+            assert_eq!(status["isError"], false, "{status}");
+            assert_eq!(status["structuredContent"]["cwd"], "/remote/partial");
+            let closed = mcp
+                .tool("close", json!({"session_id": "fixture-session"}))
+                .await;
+            assert_eq!(closed["isError"], false, "{closed}");
+            let batch = mcp.tool("exec", json!({"calls": [
+                {"name": "workspace", "arguments": {"session_id": "fixture-session"}},
+                {"name": "status", "arguments": {"session_id": "fixture-session"}},
+                {"name": "prompt", "arguments": {"session_id": "fixture-session", "cwd": "../switched", "text": "batch"}},
+                {"name": "status", "arguments": {"session_id": "fixture-session-2"}},
+                {"name": "inspect", "arguments": {"session_id": "fixture-session"}},
+            ]})).await;
+            assert_eq!(batch["isError"], false, "{batch}");
+            let steps = batch["structuredContent"]["results"].as_array().unwrap();
+            assert_eq!(steps[0]["result"]["cwd"], "/remote/partial");
+            assert_eq!(steps[1]["result"]["cwd"], "/remote/partial");
+            assert_eq!(steps[2]["result"]["previousSessionId"], "fixture-session");
+            assert_eq!(steps[3]["result"]["cwd"], "/remote/switched");
+            assert_eq!(steps[4]["result"]["cwd"], "/remote/partial");
+            assert!(
+                !backend
+                    .recorded()
+                    .iter()
+                    .any(|r| r["method"] == "session/list")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn workspace_rejected_creation_and_failed_switch_do_not_rebind_old_id() {
+    let backend = MockAcp::start().await;
+    let mut mcp = Mcp::start(&backend.url, true).await;
+    backend.workspace.lock().unwrap().reject_creation = true;
+    let rejected = mcp
+        .tool("workspace", json!({"cwd": "/remote/rejected"}))
+        .await;
+    assert_eq!(rejected["isError"], true, "{rejected}");
+    assert!(rejected["structuredContent"].get("recovery").is_none());
+    backend.workspace.lock().unwrap().reject_creation = false;
+    let created = mcp.tool("new", json!({"cwd": "/remote/old"})).await;
+    assert_eq!(created["isError"], false, "{created}");
+    backend.workspace.lock().unwrap().reject_creation = true;
+    let rejected = mcp
+        .tool(
+            "workspace",
+            json!({"session_id": "fixture-session", "cwd": "../rejected"}),
+        )
+        .await;
+    assert_eq!(rejected["isError"], true);
+    backend.workspace.lock().unwrap().reject_creation = false;
+    let failed = mcp.tool("prompt", json!({"session_id": "fixture-session", "cwd": "../new", "text": "not sent", "mode": "invalid"})).await;
+    assert_eq!(failed["isError"], true, "{failed}");
+    let recovery = &failed["structuredContent"]["recovery"];
+    assert_eq!(recovery["previousSessionId"], "fixture-session");
+    assert_eq!(recovery["sessionId"], "fixture-session-2");
+    assert_eq!(recovery["sessionCreated"], true);
+    assert_eq!(recovery["switched"], true);
+    for (id, cwd) in [
+        ("fixture-session", "/remote/old"),
+        ("fixture-session-2", "/remote/new"),
+    ] {
+        let status = mcp.tool("status", json!({"session_id": id})).await;
+        assert_eq!(status["isError"], false, "{status}");
+        assert_eq!(status["structuredContent"]["cwd"], cwd);
+    }
+    assert_no_implicit_cancel(&backend);
+}
+
+#[tokio::test]
+async fn concurrent_unknown_workspace_switches_never_bind_caller_paths_to_the_old_id() {
+    let backend = MockAcp::start().await;
+    backend.workspace.lock().unwrap().listing = Some(vec![
+        json!({"sessions": [{"sessionId": "old", "cwd": "/authoritative/old"}]}),
+    ]);
+    let mut mcp = Mcp::start(&backend.url, true).await;
+    let Mcp::Http { client, url, .. } = &mcp else {
+        unreachable!()
+    };
+    let request = |cwd| {
+        client.post(url).header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", "2025-11-25")
+        .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "workspace", "arguments": {"session_id": "old", "cwd": cwd}}}))
+    };
+    let (first, second) =
+        tokio::join!(request("/remote/one").send(), request("/remote/two").send());
+    let first: Value = first.unwrap().json().await.unwrap();
+    let second: Value = second.unwrap().json().await.unwrap();
+    let first = &first["result"]["structuredContent"];
+    let second = &second["result"]["structuredContent"];
+    assert_eq!(first["ok"], true, "{first}");
+    assert_eq!(second["ok"], true, "{second}");
+    assert_ne!(first["sessionId"], second["sessionId"]);
+    assert_eq!(first["previousSessionId"], "old");
+    assert_eq!(second["previousSessionId"], "old");
+    for (id, cwd) in [
+        (first["sessionId"].as_str().unwrap(), "/remote/one"),
+        (second["sessionId"].as_str().unwrap(), "/remote/two"),
+        ("old", "/authoritative/old"),
+    ] {
+        let status = mcp.tool("status", json!({"session_id": id})).await;
+        assert_eq!(status["isError"], false, "{status}");
+        assert_eq!(status["structuredContent"]["cwd"], cwd);
+    }
+    assert_no_implicit_cancel(&backend);
+}
+
+fn gated_creation(backend: &MockAcp) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (observed, ready) = oneshot::channel();
+    let (release, wait) = oneshot::channel();
+    backend
+        .workspace
+        .lock()
+        .unwrap()
+        .creation_gates
+        .push_back(CreationGate {
+            observed,
+            release: wait,
+        });
+    (ready, release)
+}
+
+fn concurrent_tool(mcp: &Mcp, name: &str, arguments: Value) -> JoinHandle<Value> {
+    let Mcp::Http { client, url, .. } = mcp else {
+        unreachable!()
+    };
+    let request = client.post(url).header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", "2025-11-25")
+        .json(&json!({"jsonrpc": "2.0", "id": 91, "method": "tools/call", "params": {"name": name, "arguments": arguments}}));
+    tokio::spawn(async move {
+        let response: Value = request.send().await.unwrap().json().await.unwrap();
+        response["result"].clone()
+    })
+}
+
+fn assert_creation_conflict(result: &Value, acknowledged_id: &str) {
+    assert_eq!(result["isError"], true, "{result}");
+    let content = &result["structuredContent"];
+    let recovery = &content["recovery"];
+    assert_eq!(
+        recovery["workspaceConflict"]["acknowledgedSessionId"], acknowledged_id,
+        "{result}"
+    );
+    assert_eq!(recovery["workspaceConflict"]["selectionCommitted"], false);
+    for key in [
+        "sessionId",
+        "cwd",
+        "created",
+        "sessionCreated",
+        "switched",
+        "previousSessionId",
+    ] {
+        assert!(
+            recovery.get(key).is_none(),
+            "invalid selection in recovery: {result}"
+        );
+        assert!(
+            content.get(key).is_none(),
+            "invalid usable selection: {result}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn workspace_metadata_before_creation_ack_reconciles_or_reports_a_conflict() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        for (metadata_cwd, metadata_profile, initial_profile, success) in [
+            ("/remote/new", None, Some("inherited-profile"), true),
+            (
+                "/remote/new",
+                Some("inherited-profile"),
+                Some("inherited-profile"),
+                true,
+            ),
+            ("/remote/new", Some("authoritative-profile"), None, true),
+            (
+                "/remote/contradiction",
+                None,
+                Some("inherited-profile"),
+                false,
+            ),
+            (
+                "/remote/new",
+                Some("conflicting-profile"),
+                Some("inherited-profile"),
+                false,
+            ),
+        ] {
+            let backend = MockAcp::start().await;
+            let mut mcp = Mcp::start(&backend.url, true).await;
+            let old = mcp
+                .tool(
+                    "workspace",
+                    json!({"cwd": "/remote/old", "profile": initial_profile}),
+                )
+                .await;
+            assert_eq!(old["isError"], false, "{old}");
+            let (ready, release) = gated_creation(&backend);
+            let pending = concurrent_tool(
+                &mcp,
+                "prompt",
+                json!({"session_id": "fixture-session", "cwd": "../new", "text": "switch prompt"}),
+            );
+            ready.await.unwrap();
+            // session/new has materialized B, but its ACK cannot reach qmcp yet.
+            let mut summary = json!({"sessionId": "fixture-session-2", "cwd": metadata_cwd});
+            if let Some(profile) = metadata_profile {
+                summary["_meta"] = json!({"querymt": {"profile_id": profile}});
+            }
+            backend.workspace.lock().unwrap().listing = Some(vec![json!({"sessions": [summary]})]);
+            let discovered = mcp
+                .tool("workspace", json!({"session_id": "fixture-session-2"}))
+                .await;
+            assert_eq!(discovered["isError"], false, "{discovered}");
+            assert_eq!(discovered["structuredContent"]["created"], false);
+            let status = mcp
+                .tool("status", json!({"session_id": "fixture-session-2"}))
+                .await;
+            assert_eq!(status["structuredContent"]["cwd"], metadata_cwd);
+            assert!(
+                !backend
+                    .recorded()
+                    .iter()
+                    .any(|r| r["method"] == "session/prompt")
+            );
+            release.send(()).unwrap();
+            let result = pending.await.unwrap();
+            if success {
+                assert_eq!(result["isError"], false, "{result}");
+                let content = &result["structuredContent"];
+                assert_eq!(content["sessionId"], "fixture-session-2");
+                assert_eq!(content["previousSessionId"], "fixture-session");
+                assert_eq!(content["created"], true);
+                assert_eq!(content["switched"], true);
+                let expected_profile = initial_profile.or(metadata_profile).unwrap();
+                assert_eq!(content["profile"], expected_profile);
+                assert_eq!(
+                    content["profileSource"],
+                    if initial_profile.is_some() {
+                        "inherited"
+                    } else {
+                        "authoritative-metadata"
+                    }
+                );
+                let remembered = mcp
+                    .tool("workspace", json!({"session_id": "fixture-session-2"}))
+                    .await;
+                assert_eq!(remembered["structuredContent"]["profile"], expected_profile);
+                let prompt = mcp
+                    .tool(
+                        "prompt",
+                        json!({"session_id": "fixture-session-2", "text": "actual next prompt"}),
+                    )
+                    .await;
+                assert_eq!(prompt["isError"], false, "{prompt}");
+                let requests = backend.recorded();
+                let prompts: Vec<_> = requests
+                    .iter()
+                    .filter(|r| r["method"] == "session/prompt")
+                    .collect();
+                assert_eq!(prompts.len(), 2);
+                assert!(
+                    prompts
+                        .iter()
+                        .all(|r| r["params"]["sessionId"] == "fixture-session-2")
+                );
+            } else {
+                assert_creation_conflict(&result, "fixture-session-2");
+                assert!(
+                    !backend
+                        .recorded()
+                        .iter()
+                        .any(|r| r["method"] == "session/prompt")
+                );
+                let remembered = mcp
+                    .tool("workspace", json!({"session_id": "fixture-session-2"}))
+                    .await;
+                assert_eq!(remembered["structuredContent"]["cwd"], metadata_cwd);
+                assert_eq!(
+                    remembered["structuredContent"]["profile"],
+                    json!(metadata_profile)
+                );
+            }
+            let old = mcp
+                .tool("workspace", json!({"session_id": "fixture-session"}))
+                .await;
+            assert_eq!(old["structuredContent"]["cwd"], "/remote/old");
+            assert_eq!(old["structuredContent"]["profile"], json!(initial_profile));
+            assert_no_implicit_cancel(&backend);
+        }
+    })
+    .await
+    .expect("barrier-controlled metadata/ACK test must complete");
+}
+
+#[tokio::test]
+async fn workspace_prebound_duplicate_ack_never_publishes_an_invalid_selection() {
+    for from_metadata in [false, true] {
+        for bound_cwd in ["/remote/new", "/remote/different"] {
+            let backend = MockAcp::start().await;
+            let mut mcp = Mcp::start(&backend.url, true).await;
+            let old = mcp.tool("workspace", json!({"cwd": "/remote/old"})).await;
+            assert_eq!(old["isError"], false);
+            let duplicate_id = if from_metadata {
+                backend.workspace.lock().unwrap().listing = Some(vec![
+                    json!({"sessions": [{"sessionId": "prebound", "cwd": bound_cwd}]}),
+                ]);
+                "prebound"
+            } else {
+                let prebound = mcp.tool("workspace", json!({"cwd": bound_cwd})).await;
+                assert_eq!(prebound["isError"], false);
+                "fixture-session-2"
+            };
+            let known = mcp
+                .tool("workspace", json!({"session_id": duplicate_id}))
+                .await;
+            assert_eq!(known["isError"], false);
+            backend.workspace.lock().unwrap().forced_id = Some(duplicate_id.into());
+            for name in ["workspace", "prompt"] {
+                let mut args = json!({"session_id": "fixture-session", "cwd": "/remote/new"});
+                if name == "prompt" {
+                    args["text"] = json!("must not be sent");
+                }
+                let failed = mcp.tool(name, args).await;
+                assert_creation_conflict(&failed, duplicate_id);
+            }
+            // Also cover the backend returning A itself for an A -> new switch.
+            backend.workspace.lock().unwrap().forced_id = Some("fixture-session".into());
+            let failed = mcp.tool("prompt", json!({"session_id": "fixture-session", "cwd": "/remote/new", "text": "must not be sent"})).await;
+            assert_creation_conflict(&failed, "fixture-session");
+            for (id, cwd) in [
+                ("fixture-session", "/remote/old"),
+                (duplicate_id, bound_cwd),
+            ] {
+                let known = mcp.tool("workspace", json!({"session_id": id})).await;
+                assert_eq!(known["structuredContent"]["cwd"], cwd);
+            }
+            assert!(
+                !backend
+                    .recorded()
+                    .iter()
+                    .any(|r| r["method"] == "session/prompt")
+            );
+            assert_no_implicit_cancel(&backend);
+        }
+    }
+}
+
+#[tokio::test]
+async fn workspace_two_pending_creation_acks_can_claim_a_metadata_id_only_once() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let backend = MockAcp::start().await;
+        backend.workspace.lock().unwrap().forced_id = Some("collision".into());
+        let mut mcp = Mcp::start(&backend.url, true).await;
+        let (first_ready, first_release) = gated_creation(&backend);
+        let (second_ready, second_release) = gated_creation(&backend);
+        let first = concurrent_tool(&mcp, "workspace", json!({"cwd": "/remote/same"}));
+        first_ready.await.unwrap();
+        let second = concurrent_tool(&mcp, "workspace", json!({"cwd": "/remote/same"}));
+        second_ready.await.unwrap();
+        let metadata = mcp
+            .tool("workspace", json!({"session_id": "collision"}))
+            .await;
+        assert_eq!(metadata["isError"], false, "{metadata}");
+        first_release.send(()).unwrap();
+        second_release.send(()).unwrap();
+        let results = [first.await.unwrap(), second.await.unwrap()];
+        assert_eq!(
+            results.iter().filter(|r| r["isError"] == false).count(),
+            1,
+            "{results:?}"
+        );
+        let failed = results.iter().find(|r| r["isError"] == true).unwrap();
+        assert_creation_conflict(failed, "collision");
+        assert_eq!(
+            backend
+                .recorded()
+                .iter()
+                .filter(|r| r["method"] == "session/new")
+                .count(),
+            2
+        );
+        assert_no_implicit_cancel(&backend);
+    })
+    .await
+    .expect("both barrier-controlled ACKs must complete");
+}
+
 async fn exercise_bridge(http: bool) {
     let backend = MockAcp::start().await;
     let mut mcp = Mcp::start(&backend.url, http).await;
     let catalog = mcp.rpc("tools/list", json!({})).await;
-    assert_eq!(catalog["tools"].as_array().unwrap().len(), 25);
+    assert_eq!(catalog["tools"].as_array().unwrap().len(), 26);
     assert!(
         backend.recorded().is_empty(),
         "discovery must not connect to ACP"
@@ -593,7 +1454,7 @@ async fn failures_are_tool_errors_and_timeouts_do_not_cancel_remote_work() {
 }
 
 #[tokio::test]
-async fn long_prompt_does_not_block_concurrent_runtime_requests() {
+async fn long_prompt_does_not_block_concurrent_status_runtime_steer_or_cancel() {
     let backend = MockAcp::start().await;
     let mut mcp = Mcp::start(&backend.url, true).await;
     let Mcp::Http { client, url, .. } = &mcp else {
@@ -625,6 +1486,25 @@ async fn long_prompt_does_not_block_concurrent_runtime_requests() {
     .await
     .unwrap();
     assert_eq!(runtime["isError"], false);
+    for (name, args) in [
+        ("status", json!({"session_id": "fixture-session"})),
+        (
+            "steer",
+            json!({"session_id": "fixture-session", "run_id": "fixture-run", "text": "steer while prompt waits"}),
+        ),
+        ("cancel", json!({"session_id": "fixture-session"})),
+    ] {
+        let result = tokio::time::timeout(Duration::from_millis(500), mcp.tool(name, args))
+            .await
+            .expect("workspace locks must not block control commands");
+        assert_eq!(result["isError"], false, "{name}: {result}");
+    }
+    assert!(
+        !backend
+            .recorded()
+            .iter()
+            .any(|r| r["method"] == "session/list")
+    );
     let finished = waiting.await.unwrap();
     assert_eq!(finished["result"]["structuredContent"]["code"], 4);
     backend.wait_disconnected().await;

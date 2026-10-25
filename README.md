@@ -55,7 +55,7 @@ Start with `caps`, `profiles`, and `models` to discover available capabilities.
 | Tools | Purpose |
 | --- | --- |
 | `caps`, `profiles`, `models` | Discover protocol features, profiles, and models |
-| `new`, `sessions`, `find` | Create, list, and search sessions |
+| `workspace`, `new`, `sessions`, `find` | Select a workspace without prompting; create, list, and search sessions |
 | `status`, `inspect`, `runtime` | Read configuration, history, and live runtime |
 | `get_lifecycle`, `set_lifecycle` | Read or explicitly patch resolved/archived state |
 | `pin`, `unpin` | Set session pin state |
@@ -65,10 +65,66 @@ Start with `caps`, `profiles`, and `models` to discover available capabilities.
 | `cancel`, `close` | Request turn cancellation or explicitly close a session |
 | `exec` | Run a batch sequentially on one ACP connection |
 
-Use `prompt` with `new: true` to start a session, then its returned `sessionId`
-as `session_id` to continue. Pass an explicit `cwd` for workspace operations;
-paths refer to the QueryMT host. `profiles`, `models`, lifecycle, and pin tools
-return provider data under `result`, separate from bridge status and event metadata.
+Select a workspace once, without sending a prompt, then reuse its returned ID:
+
+```text
+workspace({"cwd":"/srv/projects/app","profile":"my-profile"})
+  -> {"sessionId":"A","cwd":"/srv/projects/app","created":true,"switched":false,...}
+prompt({"session_id":"A","text":"Explain this project"})
+status({"session_id":"A"})
+workspace({"session_id":"A","cwd":"../other"})
+  -> {"sessionId":"B","previousSessionId":"A","cwd":"/srv/projects/other","created":true,"switched":true,...}
+prompt({"session_id":"B","text":"Work in the other project"})
+```
+
+`profile` is optional; discover actual IDs with `profiles`. A different directory
+creates a **new QueryMT session**, not a rebind of the old one. Always use the
+returned **new** `sessionId` as `session_id` in subsequent calls. The old ID keeps
+its workspace and work; switching does not close, cancel, or alias it. There is
+no global active chat workspace: subsequent calls still need an explicit ID.
+
+`new` and `prompt` with `new: true` also remember cwd. Continuing `prompt` can
+omit cwd; an explicit different cwd transparently creates a new session and
+returns `previousSessionId`. `status`, `inspect`, and `follow` use remembered cwd
+when omitted and reject a different cwd, directing you to `workspace` instead.
+`profiles`, `models`, lifecycle, and pin tools return provider data under
+`result`, separate from bridge status and event metadata.
+
+### Workspace Rules
+
+- Paths refer to the **QueryMT host**, not necessarily the qmcp host. Paths are
+  normalized lexically (`.` and `..`), without filesystem checks, symlink
+  resolution, or local canonicalization; the backend owns path validation.
+  This is not a sandbox or directory allowlist.
+- `workspace` without `session_id` requires an explicit initial cwd. Relative
+  initial/new paths use qmcp's once-captured startup cwd; omitted cwd for `new`
+  or `prompt(new=true)` preserves that startup-directory default. Prefer absolute
+  backend paths, especially remotely. Relative paths with a selected ID use that
+  session's remembered cwd. Only POSIX paths are supported; empty/control-character,
+  Windows drive/UNC, and `~` paths are rejected. Home expansion is never guessed.
+- Profiles explicitly selected at creation, or reported in authoritative list
+  metadata, can be inherited on switches. Otherwise a new session uses the backend
+  default, reported as `profileKnown:false` and `profileSource:"backend-default-unknown"`.
+  Same-workspace profile changes are rejected (including explicit profiles when
+  the old profile is unknown); create a workspace without an ID to choose one.
+- Bindings are process-local, shared across server clones and HTTP requests, and
+  immutable per ID. `close` retains the binding for later resume. The store holds
+  at most 4096 IDs, with no eviction; capacity errors occur before session creation.
+  No workspace lock is held across network requests or long prompts.
+- After restart, or for an unknown ID, qmcp first discovers its authoritative cwd
+  through unfiltered, paginated ACP `session/list`, without loading history.
+  Discovery scans at most 20 pages and rejects repeated cursors. Missing sessions,
+  unsupported/unavailable metadata, absent/non-absolute cwd, or incomplete scans
+  fail closed, even if a caller supplies cwd. No guessed cwd or implicit creation.
+  Metadata must accurately describe the backend's session; external backend changes
+  and symlink equivalence cannot be detected from a cached lexical binding.
+- Acknowledged new IDs and cwd are recorded before configuration/status/prompt
+  steps. Later failure or cancellation includes recovery details. If a remote
+  creation is never acknowledged, qmcp cannot know its ID; inspect backend metadata
+  before retrying. Timeouts/disconnects never implicitly cancel remote work.
+
+See [the connection guide](docs/how-to-connect.md#select-a-session-workspace)
+for the complete selection workflow.
 
 ## Important Behavior
 
