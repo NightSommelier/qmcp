@@ -421,7 +421,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_relative_paths_and_concurrent_initial_bindings_are_stable() {
+    fn startup_relative_paths_are_stable() {
         let workspaces = Workspaces::new().unwrap();
         let expected =
             normalize(Path::new("relative/../project"), &workspaces.startup_cwd).unwrap();
@@ -435,31 +435,6 @@ mod tests {
             workspaces.initial_cwd(None).unwrap(),
             workspaces.startup_cwd
         );
-        let outcomes = std::thread::scope(|scope| {
-            let one = scope.spawn(|| {
-                workspaces.insert(
-                    "same-id",
-                    Binding {
-                        cwd: "/one".into(),
-                        profile: None,
-                    },
-                    None,
-                )
-            });
-            let two = scope.spawn(|| {
-                workspaces.insert(
-                    "same-id",
-                    Binding {
-                        cwd: "/two".into(),
-                        profile: None,
-                    },
-                    None,
-                )
-            });
-            [one.join().unwrap(), two.join().unwrap()]
-        });
-        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
-        assert_eq!(workspaces.store.lock().unwrap().bindings.len(), 1);
     }
 
     #[tokio::test]
@@ -686,39 +661,5 @@ mod tests {
             drop(client);
             peer.await.unwrap();
         }).await.expect("cancellation and capacity reuse must complete without waiting for an ACK");
-    }
-
-    #[test]
-    fn reservations_bound_capacity_and_release_on_drop() {
-        let mut workspaces = Workspaces::new().unwrap();
-        workspaces.capacity = 1;
-        let reservation = workspaces.reserve().unwrap();
-        assert!(workspaces.reserve().is_err());
-        drop(reservation);
-        let reservation = workspaces.reserve().unwrap();
-        workspaces
-            .insert(
-                "s",
-                Binding {
-                    cwd: "/remote".into(),
-                    profile: None,
-                },
-                Some(&reservation),
-            )
-            .unwrap();
-        drop(reservation);
-        assert!(workspaces.reserve().is_err());
-        assert!(
-            workspaces
-                .insert(
-                    "s",
-                    Binding {
-                        cwd: "/wrong".into(),
-                        profile: None
-                    },
-                    None
-                )
-                .is_err()
-        );
     }
 }

@@ -1066,7 +1066,13 @@ async fn inspect(
     let (loaded, load_value) = client
         .load_session(session_id.clone(), cwd.clone())
         .await
-        .map_err(CliError::from_request)?;
+        .map_err(|error| {
+            if error.to_string().contains("Loaded session has no runtime ref for ACP replay") {
+                CliError::rpc("QueryMT backend cannot replay this session's history: Loaded session has no runtime ref for ACP replay. History is unavailable, not empty; qmcp cannot repair the owning runtime. No fallback was attempted.")
+            } else {
+                CliError::from_request(error)
+            }
+        })?;
     if full {
         return Ok(json!({
             "sessionId": session_id,
@@ -1375,8 +1381,8 @@ async fn follow(
     )
     .await?;
     let mut text = client.take_assistant_text().await;
-    if text.is_empty()
-        && let Ok(snapshot) = inspect(
+    if text.is_empty() {
+        let snapshot = inspect(
             client,
             session_id.clone(),
             cwd.clone(),
@@ -1384,8 +1390,7 @@ async fn follow(
             Some(1),
             false,
         )
-        .await
-    {
+        .await?;
         text = session::last_assistant_text(&snapshot).unwrap_or_default();
     }
     Ok(json!({

@@ -310,9 +310,7 @@ impl LocalOAuth {
     }
 
     pub(crate) fn guard(&self, router: Router) -> Router {
-        router
-            .layer(middleware::from_fn_with_state(self.clone(), guard))
-            .layer(middleware::from_fn(diagnostics))
+        router.layer(middleware::from_fn_with_state(self.clone(), guard))
     }
 
     fn accepts(&self, credential: &str) -> bool {
@@ -327,132 +325,6 @@ impl LocalOAuth {
 
 fn digest(value: &str) -> Digest32 {
     Sha256::digest(value.as_bytes()).into()
-}
-
-// Only fixed classifications cross into diagnostics; never request data or errors.
-#[derive(Clone, Copy)]
-struct DiagnosticError(&'static str);
-
-fn diagnostic_error(value: &str) -> DiagnosticError {
-    DiagnosticError(match value {
-        "access_denied" => "access_denied",
-        "invalid_request" => "invalid_request",
-        "invalid_token" => "invalid_token",
-        "invalid_client" => "invalid_client",
-        "invalid_client_metadata" => "invalid_client_metadata",
-        "invalid_grant" => "invalid_grant",
-        "invalid_target" => "invalid_target",
-        "invalid_scope" => "invalid_scope",
-        "unsupported_response_type" => "unsupported_response_type",
-        "unsupported_grant_type" => "unsupported_grant_type",
-        "slow_down" => "slow_down",
-        "temporarily_unavailable" => "temporarily_unavailable",
-        _ => "other",
-    })
-}
-
-#[derive(Clone, Copy)]
-enum DiagnosticReason {
-    HostRejected,
-    OriginRejected,
-    PostQuery,
-    UriTooLong,
-    InvalidJson,
-    InvalidRedirect,
-    InvalidClientName,
-    UnsupportedAuthMethod,
-    UnsupportedGrant,
-    UnsupportedResponse,
-    UnsupportedScope,
-    RegistrationRate,
-    OriginRate,
-    OriginCapacity,
-    ClientCapacity,
-    BodyRejected,
-    RandomUnavailable,
-    Registered,
-}
-
-impl DiagnosticReason {
-    fn label(self) -> &'static str {
-        match self {
-            Self::HostRejected => "host_rejected",
-            Self::OriginRejected => "origin_rejected",
-            Self::PostQuery => "post_query",
-            Self::UriTooLong => "uri_too_long",
-            Self::InvalidJson => "invalid_json",
-            Self::InvalidRedirect => "invalid_redirect",
-            Self::InvalidClientName => "invalid_client_name",
-            Self::UnsupportedAuthMethod => "unsupported_auth_method",
-            Self::UnsupportedGrant => "unsupported_grant",
-            Self::UnsupportedResponse => "unsupported_response",
-            Self::UnsupportedScope => "unsupported_scope",
-            Self::RegistrationRate => "registration_rate",
-            Self::OriginRate => "origin_rate",
-            Self::OriginCapacity => "origin_capacity",
-            Self::ClientCapacity => "client_capacity",
-            Self::BodyRejected => "body_rejected",
-            Self::RandomUnavailable => "random_unavailable",
-            Self::Registered => "registered",
-        }
-    }
-
-    fn attach(self, mut response: Response) -> Response {
-        response.extensions_mut().insert(self);
-        response
-    }
-}
-
-fn diagnostic_route(path: &str) -> &'static str {
-    match path {
-        "/mcp" => "/mcp",
-        "/.well-known/oauth-protected-resource" => "/.well-known/oauth-protected-resource",
-        "/.well-known/oauth-protected-resource/mcp" => "/.well-known/oauth-protected-resource/mcp",
-        "/.well-known/oauth-authorization-server" => "/.well-known/oauth-authorization-server",
-        "/oauth/register" => "/oauth/register",
-        "/oauth/authorize" => "/oauth/authorize",
-        "/oauth/token" => "/oauth/token",
-        _ => "/other",
-    }
-}
-
-fn diagnostic_method(method: &Method) -> &'static str {
-    match *method {
-        Method::GET => "GET",
-        Method::HEAD => "HEAD",
-        Method::POST => "POST",
-        Method::PUT => "PUT",
-        Method::PATCH => "PATCH",
-        Method::DELETE => "DELETE",
-        Method::OPTIONS => "OPTIONS",
-        Method::CONNECT => "CONNECT",
-        Method::TRACE => "TRACE",
-        _ => "OTHER",
-    }
-}
-
-async fn diagnostics(request: Request, next: Next) -> Response {
-    let route = diagnostic_route(request.uri().path());
-    let method = diagnostic_method(request.method());
-    let response = next.run(request).await;
-    let error = response.extensions().get::<DiagnosticError>();
-    let reason = response.extensions().get::<DiagnosticReason>();
-    let registration = response.extensions().get::<RegistrationDiagnostic>();
-    tracing::info!(
-        target: "qmcp::oauth_diagnostics",
-        route,
-        method,
-        status = response.status().as_u16(),
-        oauth_error = error.map_or("none", |e| e.0),
-        reason = reason.map_or("none", |r| r.label()),
-        auth_method = registration.map(|r| r.auth_method),
-        grant_types_present = registration.map(|r| r.grant_types_present),
-        grant_authcode = registration.map(|r| r.grant_authcode),
-        grant_refresh = registration.map(|r| r.grant_refresh),
-        grant_other = registration.map(|r| r.grant_other),
-        "local OAuth request"
-    );
-    response
 }
 
 struct Failure(StatusCode, &'static str);
@@ -490,9 +362,7 @@ fn secure(mut response: Response) -> Response {
 }
 
 fn error(status: StatusCode, name: &'static str) -> Response {
-    let mut response = secure((status, Json(json!({"error": name}))).into_response());
-    response.extensions_mut().insert(diagnostic_error(name));
-    response
+    secure((status, Json(json!({"error": name}))).into_response())
 }
 
 fn one_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -513,20 +383,13 @@ async fn guard(State(auth): State<LocalOAuth>, request: Request, next: Next) -> 
         !request.headers().contains_key("origin")
     };
     if !host_ok || !origin_ok {
-        let reason = if !host_ok {
-            DiagnosticReason::HostRejected
-        } else {
-            DiagnosticReason::OriginRejected
-        };
-        return reason.attach(error(StatusCode::FORBIDDEN, "access_denied"));
+        return error(StatusCode::FORBIDDEN, "access_denied");
     }
     if request.method() == Method::POST && request.uri().query().is_some() {
-        return DiagnosticReason::PostQuery
-            .attach(error(StatusCode::BAD_REQUEST, "invalid_request"));
+        return error(StatusCode::BAD_REQUEST, "invalid_request");
     }
     if request.uri().to_string().len() > MAX_BODY {
-        return DiagnosticReason::UriTooLong
-            .attach(error(StatusCode::URI_TOO_LONG, "invalid_request"));
+        return error(StatusCode::URI_TOO_LONG, "invalid_request");
     }
     let mut response = secure(next.run(request).await);
     if response
@@ -701,42 +564,6 @@ struct Registration {
     scope: Option<String>,
 }
 
-#[derive(Clone, Copy)]
-struct RegistrationDiagnostic {
-    auth_method: &'static str,
-    grant_types_present: bool,
-    grant_authcode: bool,
-    grant_refresh: bool,
-    grant_other: bool,
-}
-
-fn registration_diagnostic(registration: &Registration) -> RegistrationDiagnostic {
-    let grants = registration.grant_types.as_deref().unwrap_or_default();
-    RegistrationDiagnostic {
-        auth_method: match registration.token_endpoint_auth_method.as_deref() {
-            None => "omitted",
-            Some("none") => "none",
-            Some("client_secret_basic") => "client_secret_basic",
-            Some("client_secret_post") => "client_secret_post",
-            Some(_) => "other",
-        },
-        grant_types_present: registration.grant_types.is_some(),
-        grant_authcode: grants.iter().any(|g| g == "authorization_code"),
-        grant_refresh: grants.iter().any(|g| g == "refresh_token"),
-        grant_other: grants
-            .iter()
-            .any(|g| g != "authorization_code" && g != "refresh_token"),
-    }
-}
-
-impl RegistrationDiagnostic {
-    fn attach(self, response: Response, reason: DiagnosticReason) -> Response {
-        let mut response = reason.attach(response);
-        response.extensions_mut().insert(self);
-        response
-    }
-}
-
 fn valid_redirect(value: &str) -> bool {
     let Ok(url) = Url::parse(value) else {
         return false;
@@ -769,73 +596,56 @@ async fn register(State(auth): State<LocalOAuth>, request: Request) -> Response 
         let mut store = auth.0.store.lock().unwrap();
         store.prune(now);
         if !store.registration_rate.allow(now, REGISTRATION_RATE) {
-            return DiagnosticReason::RegistrationRate
-                .attach(error(StatusCode::TOO_MANY_REQUESTS, "slow_down"));
+            return error(StatusCode::TOO_MANY_REQUESTS, "slow_down");
         }
     }
     let bytes = match body(&auth, request, "application/json").await {
-        Ok(b) => b,
-        Err(e) => return DiagnosticReason::BodyRejected.attach(e.into_response()),
+        Ok(bytes) => bytes,
+        Err(error) => return error.into_response(),
     };
     let registration: Registration = match serde_json::from_slice(&bytes) {
-        Ok(r) => r,
-        Err(_) => {
-            return DiagnosticReason::InvalidJson
-                .attach(error(StatusCode::BAD_REQUEST, "invalid_client_metadata"));
-        }
+        Ok(registration) => registration,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid_client_metadata"),
     };
-    let diagnostic = registration_diagnostic(&registration);
-    let rejection = if registration.redirect_uris.is_empty()
+    if registration.redirect_uris.is_empty()
         || registration.redirect_uris.len() > 8
         || registration
             .redirect_uris
             .iter()
-            .any(|u| !valid_redirect(u))
+            .any(|uri| !valid_redirect(uri))
+        || registration
+            .client_name
+            .as_ref()
+            .is_some_and(|name| name.len() > 128 || name.chars().any(char::is_control))
+        || registration
+            .token_endpoint_auth_method
+            .as_deref()
+            .is_some_and(|method| method != "none")
+        || registration.grant_types.as_ref().is_some_and(|grants| {
+            !grants.iter().any(|grant| grant == "authorization_code")
+                || grants
+                    .iter()
+                    .any(|grant| grant != "authorization_code" && grant != "refresh_token")
+                || grants.iter().collect::<HashSet<_>>().len() != grants.len()
+        })
+        || registration
+            .response_types
+            .as_ref()
+            .is_some_and(|types| types != &["code"])
+        || registration
+            .scope
+            .as_deref()
+            .is_some_and(|scope| scope != SCOPE)
     {
-        Some(DiagnosticReason::InvalidRedirect)
-    } else if registration
-        .client_name
-        .as_ref()
-        .is_some_and(|n| n.len() > 128 || n.chars().any(char::is_control))
-    {
-        Some(DiagnosticReason::InvalidClientName)
-    } else if registration
-        .token_endpoint_auth_method
-        .as_deref()
-        .is_some_and(|m| m != "none")
-    {
-        Some(DiagnosticReason::UnsupportedAuthMethod)
-    } else if registration.grant_types.as_ref().is_some_and(|g| {
-        !g.iter().any(|v| v == "authorization_code")
-            || g.iter()
-                .any(|v| v != "authorization_code" && v != "refresh_token")
-            || g.iter().collect::<HashSet<_>>().len() != g.len()
-    }) {
-        Some(DiagnosticReason::UnsupportedGrant)
-    } else if registration
-        .response_types
-        .as_ref()
-        .is_some_and(|r| r != &["code"])
-    {
-        Some(DiagnosticReason::UnsupportedResponse)
-    } else if registration.scope.as_deref().is_some_and(|s| s != SCOPE) {
-        Some(DiagnosticReason::UnsupportedScope)
-    } else {
-        None
-    };
-    if let Some(reason) = rejection {
-        return diagnostic.attach(
-            error(StatusCode::BAD_REQUEST, "invalid_client_metadata"),
-            reason,
-        );
+        return error(StatusCode::BAD_REQUEST, "invalid_client_metadata");
     }
     let id = match random() {
         Ok(id) => id,
-        Err(e) => return diagnostic.attach(e.into_response(), DiagnosticReason::RandomUnavailable),
+        Err(error) => return error.into_response(),
     };
     let mut store = auth.0.store.lock().unwrap();
-    // No client identity exists yet: bound registrations by validated callback
-    // origin as well as aggregate work. Never fetch descriptive metadata URLs.
+    // Bound registrations by validated callback origin and aggregate work.
+    // Descriptive metadata URLs are never fetched.
     let origins: HashSet<_> = registration
         .redirect_uris
         .iter()
@@ -846,10 +656,7 @@ async fn register(State(auth): State<LocalOAuth>, request: Request) -> Response 
         .filter(|origin| !store.registration_origins.contains_key(*origin))
         .count();
     if store.registration_origins.len() + new_origins > MAX_REGISTRATION_ORIGINS {
-        return diagnostic.attach(
-            error(StatusCode::TOO_MANY_REQUESTS, "slow_down"),
-            DiagnosticReason::OriginCapacity,
-        );
+        return error(StatusCode::TOO_MANY_REQUESTS, "slow_down");
     }
     for origin in origins {
         if !store
@@ -858,10 +665,7 @@ async fn register(State(auth): State<LocalOAuth>, request: Request) -> Response 
             .or_default()
             .allow(now, 16)
         {
-            return diagnostic.attach(
-                error(StatusCode::TOO_MANY_REQUESTS, "slow_down"),
-                DiagnosticReason::OriginRate,
-            );
+            return error(StatusCode::TOO_MANY_REQUESTS, "slow_down");
         }
     }
     if store.clients.len() >= MAX_CLIENTS
@@ -872,12 +676,12 @@ async fn register(State(auth): State<LocalOAuth>, request: Request) -> Response 
             .count()
             >= MAX_UNAPPROVED_CLIENTS
     {
-        return diagnostic.attach(
-            error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable"),
-            DiagnosticReason::ClientCapacity,
-        );
+        return error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable");
     }
-    let refresh_allowed = diagnostic.grant_refresh;
+    let refresh_allowed = registration
+        .grant_types
+        .as_ref()
+        .is_some_and(|grants| grants.iter().any(|grant| grant == "refresh_token"));
     let grants = if refresh_allowed {
         vec!["authorization_code", "refresh_token"]
     } else {
@@ -908,7 +712,7 @@ async fn register(State(auth): State<LocalOAuth>, request: Request) -> Response 
             exchange_rate: Rate::default(),
         },
     );
-    diagnostic.attach(response, DiagnosticReason::Registered)
+    response
 }
 
 fn completion(
@@ -930,14 +734,10 @@ fn completion(
     }
     // An ordinary user-clicked link is not a form-action redirect. Keep the
     // callback/code private and do not navigate externally without another click.
-    let mut response = Html(format!(
+    Html(format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>Complete qmcp authorization</title></head><body><h1>Complete authorization</h1><p>Continue to the callback you reviewed, including after denial.</p><a href=\"{}\" rel=\"noreferrer noopener\">Continue to ChatGPT</a></body></html>",
         escape(url.as_str())
-    )).into_response();
-    if key == "error" {
-        response.extensions_mut().insert(diagnostic_error(value));
-    }
-    response
+    )).into_response()
 }
 
 fn escape(text: &str) -> String {

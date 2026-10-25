@@ -27,63 +27,27 @@ non-loopback ACP requires `--allow-insecure`. qmcp does not launch QueryMT.
 
 ## Select a Session Workspace
 
-After connecting using any transport, use `workspace` to choose a directory on
-**the QueryMT host** without sending a prompt. There is no chat-global active cwd;
-the returned `sessionId` is the explicit handle for later calls.
+Call `workspace({"cwd":"/srv/projects/app","profile":"<optional profile ID>"})`
+without sending a prompt. Reuse its returned `sessionId` in later calls; omit cwd
+until you explicitly change it. There is no global active workspace.
+`workspace({"session_id":"A","cwd":"../other"})` creates session B, leaving A
+unchanged. Use B's returned ID. Continuing `prompt` with a different cwd behaves
+likewise; `status`, `inspect`, and `follow` reject a different cwd.
 
-```text
-workspace({"cwd":"/srv/projects/app"})
-  -> {"sessionId":"A","cwd":"/srv/projects/app","created":true,"switched":false,...}
-prompt({"session_id":"A","text":"Describe the project"})
-status({"session_id":"A"})
-inspect({"session_id":"A"})
-workspace({"session_id":"A","cwd":"../other"})
-  -> {"sessionId":"B","previousSessionId":"A","cwd":"/srv/projects/other","created":true,"switched":true,...}
-prompt({"session_id":"B","text":"Use this project now"})
-```
+Paths refer to the QueryMT host and normalize `.`/`..` lexically, without local
+filesystem or symlink checks. Initial relative paths use qmcp's startup cwd;
+subsequent paths use the bound session cwd. Supply absolute remote paths;
+`~`, Windows paths, empty paths, and control characters are rejected.
+Known profiles are inherited on switches; unknown ones use the backend default
+and report `profileKnown:false`. Same-directory profile changes are rejected.
 
-Always keep and use the returned **new ID** after a switch. QueryMT does not
-reliably rebind a materialized session, so changing directories creates a new
-backend session. The old session stays unchanged, with no implicit close, cancel,
-or ID alias. Omitted cwd or an equivalent normalized path selects the same ID
-with `created:false, switched:false`. Continuing `prompt` with a different cwd
-has the same new-session behavior and returns `previousSessionId` too.
-Read-only `status`, `inspect`, and `follow` remember cwd when omitted and reject
-explicit different cwd, suggesting `workspace`; they never create a session.
-
-`workspace` without an ID requires cwd. `new` and `prompt(new=true)` also pin cwd
-immediately on acknowledgement, even when later configuration fails. They retain
-qmcp's startup-directory default if cwd is omitted. Initial/new relative paths
-resolve from the once-captured qmcp startup cwd; relative paths with an existing
-ID resolve from that session's cwd. Prefer absolute paths for remote QueryMT.
-Normalization is lexical POSIX `.`/`..` processing, not a local filesystem check
-or symlink resolution. `~` is rejected: supply an absolute backend home path
-instead. Empty/control-character and Windows drive/UNC paths are rejected too.
-The backend validates paths; workspace selection is not a sandbox or allowlist.
-
-Optionally supply `profile` on creation (discover IDs with `profiles`). Switches
-inherit a known profile selected at creation or reported by backend list metadata.
-If unknown, the backend default is used and the result explicitly reports
-`profileKnown:false`, `profileSource:"backend-default-unknown"`. A same-workspace
-explicit different/unknown profile is rejected; profile changing is not part of
-workspace selection. Start without an ID to select a new profile independently.
-
-Bindings live in qmcp memory (4096 IDs, no eviction), shared by all server clones,
-HTTP requests, and sequential `exec` steps. Closing a session retains its binding
-for resume. Unknown IDs and IDs after qmcp restart require authoritative cwd from
-unfiltered paginated `session/list`, at most 20 pages with repeated-cursor detection.
-No history is loaded before cwd is known. Unsupported/missing cwd metadata,
-not-found sessions, and incomplete scans produce distinct fail-closed errors,
-not guessed paths or implicit sessions, even with explicit caller cwd. Accurate
-backend metadata is required; cached lexical bindings cannot detect external
-workspace changes or symlink equivalence. No locks span network operations, so
-long prompts do not block session-ID-only runtime/steer/cancel calls.
-
-Check `recovery` on failures/timeouts before retrying; acknowledged new IDs remain
-usable without cwd. A creation whose acknowledgement never arrives may still
-exist remotely but has no locally known ID. Cancellation/disconnect does not
-implicitly cancel or close remote work. This feature does not alter or deploy
-the running QueryMT service or change global backend configuration.
+Bindings are immutable per ID, process-local, shared across HTTP calls, retained
+on close, and capped at 4096 without eviction. Unknown IDs (including after
+restart) require unfiltered paginated `session/list` metadata. Missing cwd,
+repeated cursors, unavailable metadata, or the 20-page scan limit fail closed;
+caller cwd cannot override them. Check `recovery` before retrying failed creation:
+an acknowledged ID is retained, but an unacknowledged creation may still exist
+remotely. Timeouts never implicitly cancel remote work.
 
 ## Local stdio
 
@@ -155,17 +119,12 @@ to keep qmcp private. Your account/workspace must allow tunnels and custom MCP s
 
 ## Embedded OAuth on macOS (ChatGPT)
 
-qmcp includes a single-owner OAuth authorization server. No Docker, external
-identity provider, or separate login service is needed. Start QueryMT locally,
-then put qmcp behind a trusted HTTPS reverse proxy. qmcp does not terminate TLS.
-The resource must be a canonical HTTPS URL ending in exactly `/mcp`, without
-userinfo, query, or fragment. Its origin is the issuer (no trailing slash).
+qmcp runs the single-owner authorization server on the Mac. TLS terminates at
+your trusted HTTPS proxy; the canonical public resource must end in `/mcp` with
+no userinfo, query, or fragment. Its origin is the issuer.
 
-### Generate the owner credential
-
-Generate a new secret, not a human-chosen password. This example creates a
-private file without printing its contents, and refuses to overwrite an existing
-file. Run it only when preparing a deployment, not as part of a source review:
+Generate a credential only when preparing deployment (these commands do not
+print it and refuse to overwrite an existing file):
 
 ```sh
 umask 077
@@ -175,21 +134,13 @@ chmod 700 "$HOME/.config/qmcp"
 chmod 600 "$HOME/.config/qmcp/owner-secret"
 ```
 
-Keep the generated value in a trusted password manager for browser login. Never
-put it in command arguments, URLs, environment variables, logs, source control,
-or a PR. qmcp never creates or prints an owner credential. It accepts 32..64
-random bytes encoded as 64..128 lowercase hex characters, optionally followed
-by a newline. Length/encoding and obvious-weakness checks cannot prove entropy;
-**only use a cryptographically generated secret**, not a phrase or password.
-The absolute file path must name a regular file owned by qmcp's user, mode
-`0600`, with no final-component symlink or hard links. Keep its parent directory
-private and free of untrusted symlinks/ACLs. Secret-file protection currently
-requires Unix (including macOS).
+Use only 32..64 cryptographically random bytes encoded as lowercase hex, never
+a password. Keep the value in a trusted password manager for browser login, not
+URLs, arguments, environment, logs, or source control. The absolute secret path
+must be an owned Unix regular file, mode `0600`, without symlinks or hard links;
+protect its parent directory too. qmcp neither generates nor prints the secret.
 
-### Run and connect
-
-Leave `QMCP_BEARER_TOKEN` and `QMCP_OAUTH_CLIENT_SECRET` unset, then run after
-reviewing your deployment configuration:
+Leave `QMCP_BEARER_TOKEN` and `QMCP_OAUTH_CLIENT_SECRET` unset, then run:
 
 ```sh
 qmcp --transport http --permission cancel \
@@ -197,149 +148,38 @@ qmcp --transport http --permission cancel \
   --oauth-owner-secret-file "$HOME/.config/qmcp/owner-secret"
 ```
 
-The default bind is `127.0.0.1:3031`. For a proxy on another host, see the
-[Nginx/VPN example](#separate-nginx-server-to-a-mac-over-vpn). Embedded OAuth
-accepts only the canonical public resource Host, which is also added to MCP's
-Host allowlist; additional host aliases do not broaden that outer guard.
-Local OAuth, external OAuth (`--oauth-config`), and static Bearer are mutually
-exclusive. HTTP authentication options are rejected in stdio mode; an owner
-secret flag without a local resource is rejected too.
+The default listener is `127.0.0.1:3031`. For a separate proxy, use the
+[Nginx/VPN template](#separate-nginx-server-to-a-mac-over-vpn). Forward `/mcp`,
+`/.well-known/oauth-authorization-server`, both protected-resource discovery
+paths, and `/oauth/register`, `/oauth/authorize`, `/oauth/token`. Preserve Host,
+Authorization, Origin, and queries. The public resource Host is automatically
+allowed; local/external OAuth and static Bearer modes are mutually exclusive.
 
-Forward **all** these paths through the HTTPS proxy, preserving Host,
-Authorization, Origin, and query strings:
+In ChatGPT, add the public `/mcp` URL, choose **OAuth**, and use DCR. Do not put
+the owner credential in client ID/secret fields. During sign-in verify the domain,
+unverified client name, and exact callback. Enter the credential on qmcp's owner
+page and explicitly approve or deny, then click **Continue to ChatGPT**.
+Registration alone grants nothing. Custom MCP servers must be enabled in your
+workspace; live sign-in still needs deployment validation.
 
-- `/mcp`
-- `/.well-known/oauth-authorization-server`
-- `/.well-known/oauth-protected-resource` and its `/mcp` variant
-- `/oauth/register`, `/oauth/authorize`, `/oauth/token`
+Security/lifetime constraints:
 
-In ChatGPT, add a custom MCP server with `https://mcp.example.com/mcp` and select
-**OAuth**. Use dynamic client registration (DCR); do not enter the owner secret
-as a client ID/secret. During sign-in, verify the public domain, the unverified
-client name, and its exact callback URL. Enter the generated owner secret on
-qmcp's **Owner login + authorize** page and explicitly choose **Log in and
-Approve**, or choose **Deny**. Then explicitly click **Continue to ChatGPT** on
-the completion page (also after denial). This extra click returns the code or
-error, state, and issuer to the registered callback; there is no automatic
-cross-origin redirect after form submission. Registration alone grants no
-access. Workspace settings must allow custom MCP servers. The flow is covered
-by local tests; live ChatGPT interoperability still needs deployment validation.
-
-### Private OAuth diagnostics
-
-For a reviewed deployment, opt in with
-`RUST_LOG='warn,qmcp::oauth_diagnostics=info'` in the qmcp process environment.
-Keep stderr private. This target logs fixed route/method labels, HTTP status,
-allowlisted OAuth error/rejection reasons, and normalized DCR authentication and
-recognized grant flags only. Unknown routes become `/other`; no header values,
-URLs, queries, bodies, client IDs, remote IPs, or credentials are logged.
-Unknown registration metadata remains ignored. Do not enable broader
-`rmcp`/`reqwest` debug or trace logs to diagnose app creation.
-
-These diagnostics identify which requests reach qmcp and how it responds; they
-do not establish the cause of a generic ChatGPT rejection without a retry.
-Enabling them in a new process requires a reviewed restart, which discards all
-volatile OAuth state; re-registration may be needed.
-
-### Security and operational limits
-
-- Discovery advertises authorization-code and refresh-token grants for public
-  DCR clients (`token_endpoint_auth_method: none`), with PKCE `S256` required
-  for the initial code exchange. Registration requires `authorization_code`;
-  `refresh_token` is optional. The grant set is order independent, with no
-  duplicates or unsupported grants; omission defaults to authorization-code
-  only. The response echoes the normalized registered set. Only clients that
-  register the refresh grant receive refresh tokens after explicit owner approval
-  and a valid PKCE exchange. No implicit grant, CIMD URL fetching, or client
-  secret authentication is supported. Registration never fetches a supplied URL.
-- The exact registered redirect, public resource, client, and `qmcp:access`
-  scope are bound to authorization and code exchange. HTTPS callbacks are
-  required except literal loopback/localhost HTTP callbacks. Redirects with
-  fragments, credentials, or reserved OAuth response query fields are rejected.
-  Unknown descriptive registration metadata (including `client_uri` and
-  `logo_uri`) and authorization/token extension parameters are ignored, never
-  fetched or rendered. Known security parameters remain strict, including
-  duplicate rejection; unsupported grants and authentication/PKCE methods are
-  rejected. Credential-bearing authorization query parameters are rejected.
-  Up to eight redirects and a 128-byte client name fit in an 8 KiB body.
-- Each five-minute browser transaction requires a random CSRF token and a
-  Secure, HttpOnly, SameSite=Lax, path-scoped cookie. Form POSTs require the
-  exact issuer Origin. MCP and all other routes reject Origin; never strip it
-  at the proxy to bypass validation. Login and completion HTML use
-  `Referrer-Policy: same-origin` so real form submissions retain the exact
-  Origin; `Origin: null` is never accepted. Invalid cookies, CSRF, or Origin
-  do not consume owner attempts or destroy a valid transaction. Each validated
-  transaction has one owner attempt, with eight attempts per client per minute.
-  There is no remembered login or silent approval.
-- Codes expire after 90 seconds and are consumed atomically, including on a
-  failed binding/PKCE check. Transient capacity failures leave a valid code usable
-  until its original expiry. Access tokens last 30 minutes, capped at their
-  refresh family's deadline when applicable. Only SHA-256 digests of owner
-  credentials, cookies, CSRF tokens, codes, access tokens and refresh tokens are
-  retained in server state. Tokens are opaque, generated from 32 cryptographically
-  random bytes. Responses use no-store and restrictive
-  CSP, framing and referrer policies. Completion pages contain a normal escaped
-  callback link with `rel="noreferrer noopener"`, no scripts, forms, or automatic
-  navigation. Codes in that private HTML must not be logged or cached.
-- Refresh families have an **absolute 24-hour lifetime from the initial code
-  exchange**; rotation never extends that deadline. Refresh uses `/oauth/token`
-  with `grant_type=refresh_token`, the public `client_id`, and `refresh_token`.
-  It does not require browser cookies, another owner login, or client secrets:
-  possession of the refresh token is the authorization. The client, original
-  canonical resource and `qmcp:access` scope remain bound. An omitted `resource`
-  reuses the original resource (RFC 8707); if supplied, it must match exactly.
-  Scope must be omitted or exactly `qmcp:access`, never expanded. Host, no-Origin,
-  duplicate-security-parameter and no-POST-query guards still apply.
-- Every successful refresh atomically consumes its token and issues new access
-  and refresh tokens. Consumed digests remain until family expiry, including
-  after revocation. Reusing a consumed token with valid client/resource/scope
-  bindings returns `400 invalid_grant` and revokes **all access and refresh tokens
-  in that family**, not other families (even for the same client). Wrong bindings
-  or malformed requests do not consume a valid token or revoke a family. Clients
-  must serialize refreshes: concurrent exchanges issue at most one response,
-  and the other request is a replay that revokes even the winner's tokens. A lost
-  successful response followed by retry also requires a new owner authorization.
-  There is no refresh reuse grace period, external-provider delegation or silent
-  recovery after replay, absolute expiry, or the chain limit.
-- All state is **volatile**. Restart invalidates grants, tokens, transactions,
-  and DCR client IDs; ChatGPT may require removing and re-adding the server,
-  not just signing in again. Valid owner approval retains that client identity
-  until process restart; only unapproved registrations expire after one hour.
-  There is no database, registration management API, per-client revocation, or
-  persistence.
-- Capacity is 128 clients (at most 96 unapproved), 128 browser transactions,
-  128 codes and 256 access tokens. Approved identities are never evicted by spam.
-  Each client can hold at most eight transactions, eight codes and 16 access
-  tokens. Refresh state is capped at 128 families globally, eight per client,
-  8,192 total refresh digests, and 128 digests per family (the original plus at
-  most 127 rotations). Revoked families still occupy their slots until expiry.
-  Live access tokens are retained until expiry or family revocation; frequent
-  refreshes can hit the access-token limit before the chain limit. Capacity
-  exhaustion returns `503 temporarily_unavailable` without consuming a valid
-  code/current refresh token; rate exhaustion returns `429 slow_down`. No replay
-  evidence is evicted to make room. At the chain limit a new owner authorization
-  is needed. All expired state is pruned on use. Per-minute limits are 30
-  authorizations and 60 known-code/validly-bound-refresh exchanges per client;
-  unknown credentials cannot spend a named client's exchange budget. Registration has no authenticated client identity:
-  each validated callback origin gets 16 registrations/minute, with at most
-  256 fixed-memory origin buckets. Aggregate ceilings are 1,024 registration
-  requests and 4,096 authorization/token requests per endpoint per minute,
-  not a tiny shared owner-login lockout.
-  AS bodies have an 8 KiB limit, 16 concurrent readers and a ten-second read
-  timeout. Limits never trust `X-Forwarded-For` or other client-IP/proxy headers.
-  Residual resource DoS remains possible: many clients/callback origins, or
-  requests naming a public client ID, can exhaust table/CPU/network capacity
-  or that client's authorization window. Configure deployment-specific
-  connection/concurrency, request-rate, body-size, and upload-time limits at
-  the trusted proxy (and its trusted source-IP configuration). Application
-  limits are not a substitute for those controls. No automatic eviction of
-  live approved clients or grants is attempted.
-- This is a **single-owner backend**, not multi-user isolation. Approval grants
-  all tools on the connected QueryMT instance. `--permission cancel` controls
-  agent tool approval, not OAuth scope. Protect the owner secret accordingly.
-  For rotation or global revocation, replace the protected file and perform a
-  reviewed restart. Keep TLS termination, proxy logs (no query/body/header or
-  token-response logging for OAuth), firewall and the private upstream secure.
+- Public clients use authorization-code + PKCE `S256`; DCR may additionally request
+  `refresh_token`. Exact client, redirect, resource, and scope are bound to grants.
+  Metadata URLs are never fetched. Login requires an issuer-Origin form POST,
+  a browser cookie, CSRF token, and explicit owner consent. Other routes reject Origin.
+- Approval grants all tools on this backend (`qmcp:access`), not per-user isolation.
+  `--permission cancel` controls agent approvals, not MCP authentication.
+- Access lasts up to 30 minutes; rotating one-use refresh tokens have an absolute
+  24-hour family deadline. Replay revokes the entire family. Serialize refreshes:
+  concurrent refreshes or retrying a lost successful response can revoke the winner.
+- Credentials are stored as digests; state is bounded and volatile. Restart invalidates client IDs and tokens;
+  ChatGPT may require removing/re-adding the server. Approved clients survive until
+  restart; unapproved registrations expire after one hour. No persistence is supplied.
+- Capacity/rate errors do not evict replay evidence or consume valid credentials.
+  A family allows at most 127 rotations; exhaustion requires owner authorization
+  again. Keep proxy connection/body/rate limits and private logs: application bounds
+  do not prevent all resource exhaustion. Never log OAuth queries, bodies, or tokens.
 
 ## External OAuth Provider (Optional)
 
@@ -387,37 +227,17 @@ configuration and has not been verified by the project's mock-provider tests.
 
 ## Separate Nginx server to a Mac over VPN
 
-Topology: ChatGPT -> Nginx (public HTTPS) -> Mac (private/VPN HTTP) ->
-local QueryMT.
-This is a deployment template, not a claim of a verified live connection.
-Use embedded OAuth on the Mac; an external provider is optional. TLS and
-proxying alone do not enable ChatGPT authentication; a static bearer is not a
-substitute. If you choose external OAuth instead, an arbitrary OIDC provider
-may lack the introspection endpoint or claims described in the optional section.
-
-Replace every `mcp.example.com` with your public domain and every `10.0.0.42`
-with the Mac's actual private/VPN IP; both are placeholders. Point public DNS to
-Nginx, not the Mac, and use a valid TLS certificate for that domain on Nginx.
-
-On the Mac, keep QueryMT on `ws://127.0.0.1:3030/acp/ws` as described above.
-Generate the protected owner secret as described above. Leave
-`QMCP_BEARER_TOKEN` and `QMCP_OAUTH_CLIENT_SECRET` unset. After reviewing the
-configuration, run on the Mac (all addresses and paths here are examples):
+Topology: ChatGPT -> public HTTPS Nginx -> encrypted VPN -> qmcp on Mac:3031
+-> local QueryMT. Replace the example domain, VPN address, and certificate paths.
+Keep QueryMT's ACP port private. On the Mac, use the protected owner file above:
 
 ```sh
-qmcp --transport http --bind 10.0.0.42:3031 \
-  --allowed-host mcp.example.com --permission cancel \
+qmcp --transport http --bind 10.0.0.42:3031 --permission cancel \
   --oauth-local-resource https://mcp.example.com/mcp \
   --oauth-owner-secret-file /absolute/private/path/to/owner-secret
 ```
 
-`--bind` takes an IP:port socket address, not a URL or hostname. This binds only
-the Mac's VPN/private interface; OAuth is required for this non-loopback bind.
-Use the installed qmcp binary's absolute path if it is not on `PATH`.
-
-On the separate Nginx host, adapt this HTTPS server template; certificate paths
-are placeholders too. Keep the upstream without a URI suffix so MCP, discovery,
-and all embedded authorization-server endpoints and queries reach qmcp unchanged:
+On the separate proxy host (not deployment instructions to execute during review):
 
 ```nginx
 server {
@@ -425,45 +245,29 @@ server {
     server_name mcp.example.com;
     ssl_certificate /path/to/fullchain.pem;
     ssl_certificate_key /path/to/privkey.pem;
-
     location / {
         proxy_pass http://10.0.0.42:3031;
         proxy_http_version 1.1;
         proxy_set_header Host $http_host;
         proxy_set_header Authorization $http_authorization;
         proxy_set_header Origin $http_origin;
-        access_log off; # OAuth queries contain authorization codes/state.
         proxy_set_header Connection "";
+        access_log off; # OAuth queries contain codes/state.
         proxy_buffering off;
         proxy_request_buffering off;
         proxy_cache off;
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
     }
-
 }
 ```
 
-The Host must match `--allowed-host`; do not replace it with the upstream IP.
-Forward Authorization unchanged; allow token-free discovery and preserve
-qmcp's `WWW-Authenticate` responses. Do not strip Origin to bypass qmcp's
-checks.
-Buffering/cache are disabled for Streamable HTTP; the example timeouts are
-inactivity limits, not a guarantee of task duration. Align any other proxy or
-load-balancer timeouts with long-lived requests.
-
-Allow inbound TCP 3031 on the Mac only from the Nginx host's VPN source IP,
-over the VPN interface; deny other sources. Do not publish/port-forward 3031 or
-expose QueryMT's ACP port. Plain HTTP here assumes the proxy-to-Mac hop uses the
-encrypted VPN, not an untrusted LAN. Verify Nginx can route to that Mac address;
-keep the VPN connected, the Mac awake/reachable, and QueryMT and qmcp running.
-Validate the adapted Nginx configuration with `nginx -t` before deploying it.
-After deployment, the AS metadata and both resource-discovery paths should
-return metadata without a token, and `/mcp` should reject missing/invalid tokens.
-Only then follow the embedded OAuth ChatGPT setup above using
-`https://mcp.example.com/mcp`, not the private IP. Deployment and real sign-in
-verification are separate from source/build review; do not restart a live
-service merely to run tests.
+The upstream has no URI suffix, so discovery and authorization paths reach qmcp
+unchanged. Never strip Origin to bypass validation. Firewall Mac port 3031 to the
+proxy's VPN source only; do not expose it or ACP publicly. Plain HTTP assumes the
+encrypted VPN hop, not an untrusted LAN. Keep the Mac awake and VPN reachable.
+Validate adapted Nginx configuration before deployment. Source tests do not prove
+real ChatGPT sign-in and must not restart installed services.
 
 ## Remote Access Checklist
 

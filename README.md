@@ -20,10 +20,9 @@ cargo install --locked --path .
 
 ## Connect
 
-For a single-owner ChatGPT connection on macOS, qmcp includes OAuth login,
-consent, public-client registration and PKCE. No external provider or Docker
-service is required. Use an HTTPS reverse proxy and a generated owner credential
-in a private `0600` file:
+For ChatGPT, qmcp provides embedded single-owner OAuth with explicit consent,
+PKCE, dynamic client registration, and rotating refresh tokens. Run it on the
+Mac behind an HTTPS reverse proxy; no external login service is needed:
 
 ```sh
 qmcp --transport http --permission cancel \
@@ -31,21 +30,10 @@ qmcp --transport http --permission cancel \
   --oauth-owner-secret-file /absolute/private/path/to/owner-secret
 ```
 
-These are example values, not a deployment configuration. See
-[How to connect](docs/how-to-connect.md#embedded-oauth-on-macos-chatgpt) for secret
-generation, proxy setup and ChatGPT sign-in. Embedded OAuth is single-owner and
-volatile: restarting invalidates tokens **and registered client IDs**, so you may
-need to re-add the server in ChatGPT. Only unapproved registrations expire after
-one hour; approved registrations survive until restart. Discovery advertises
-PKCE authorization-code and rotating refresh-token grants. Access tokens last
-30 minutes (capped at family expiry); clients registered for refresh receive
-one-use refresh tokens with an absolute 24-hour family lifetime from the initial
-code exchange, never extended by rotation. Replay revokes the family's access
-and refresh tokens. Restart invalidates refresh state too; see the guide for
-capacity limits and serialized-refresh requirements.
-
-Local stdio, static Bearer over HTTPS, private tunnels, and optional external
-OAuth introspection remain available in the [connection guide](docs/how-to-connect.md).
+See the [connection guide](docs/how-to-connect.md) for credential generation,
+proxy configuration, stdio, static Bearer, tunnels, or external OAuth.
+OAuth state is volatile: restart invalidates tokens and registered client IDs.
+Approval grants all backend tools, not multi-user isolation.
 
 ## Tools
 
@@ -65,66 +53,22 @@ Start with `caps`, `profiles`, and `models` to discover available capabilities.
 | `cancel`, `close` | Request turn cancellation or explicitly close a session |
 | `exec` | Run a batch sequentially on one ACP connection |
 
-Select a workspace once, without sending a prompt, then reuse its returned ID:
+Choose a workspace once without prompting, then reuse the returned ID:
 
 ```text
 workspace({"cwd":"/srv/projects/app","profile":"my-profile"})
-  -> {"sessionId":"A","cwd":"/srv/projects/app","created":true,"switched":false,...}
-prompt({"session_id":"A","text":"Explain this project"})
-status({"session_id":"A"})
-workspace({"session_id":"A","cwd":"../other"})
-  -> {"sessionId":"B","previousSessionId":"A","cwd":"/srv/projects/other","created":true,"switched":true,...}
-prompt({"session_id":"B","text":"Work in the other project"})
+prompt({"session_id":"<returned sessionId>","text":"Explain this project"})
+workspace({"session_id":"<returned sessionId>","cwd":"../other"})
 ```
 
-`profile` is optional; discover actual IDs with `profiles`. A different directory
-creates a **new QueryMT session**, not a rebind of the old one. Always use the
-returned **new** `sessionId` as `session_id` in subsequent calls. The old ID keeps
-its workspace and work; switching does not close, cancel, or alias it. There is
-no global active chat workspace: subsequent calls still need an explicit ID.
-
-`new` and `prompt` with `new: true` also remember cwd. Continuing `prompt` can
-omit cwd; an explicit different cwd transparently creates a new session and
-returns `previousSessionId`. `status`, `inspect`, and `follow` use remembered cwd
-when omitted and reject a different cwd, directing you to `workspace` instead.
-`profiles`, `models`, lifecycle, and pin tools return provider data under
-`result`, separate from bridge status and event metadata.
-
-### Workspace Rules
-
-- Paths refer to the **QueryMT host**, not necessarily the qmcp host. Paths are
-  normalized lexically (`.` and `..`), without filesystem checks, symlink
-  resolution, or local canonicalization; the backend owns path validation.
-  This is not a sandbox or directory allowlist.
-- `workspace` without `session_id` requires an explicit initial cwd. Relative
-  initial/new paths use qmcp's once-captured startup cwd; omitted cwd for `new`
-  or `prompt(new=true)` preserves that startup-directory default. Prefer absolute
-  backend paths, especially remotely. Relative paths with a selected ID use that
-  session's remembered cwd. Only POSIX paths are supported; empty/control-character,
-  Windows drive/UNC, and `~` paths are rejected. Home expansion is never guessed.
-- Profiles explicitly selected at creation, or reported in authoritative list
-  metadata, can be inherited on switches. Otherwise a new session uses the backend
-  default, reported as `profileKnown:false` and `profileSource:"backend-default-unknown"`.
-  Same-workspace profile changes are rejected (including explicit profiles when
-  the old profile is unknown); create a workspace without an ID to choose one.
-- Bindings are process-local, shared across server clones and HTTP requests, and
-  immutable per ID. `close` retains the binding for later resume. The store holds
-  at most 4096 IDs, with no eviction; capacity errors occur before session creation.
-  No workspace lock is held across network requests or long prompts.
-- After restart, or for an unknown ID, qmcp first discovers its authoritative cwd
-  through unfiltered, paginated ACP `session/list`, without loading history.
-  Discovery scans at most 20 pages and rejects repeated cursors. Missing sessions,
-  unsupported/unavailable metadata, absent/non-absolute cwd, or incomplete scans
-  fail closed, even if a caller supplies cwd. No guessed cwd or implicit creation.
-  Metadata must accurately describe the backend's session; external backend changes
-  and symlink equivalence cannot be detected from a cached lexical binding.
-- Acknowledged new IDs and cwd are recorded before configuration/status/prompt
-  steps. Later failure or cancellation includes recovery details. If a remote
-  creation is never acknowledged, qmcp cannot know its ID; inspect backend metadata
-  before retrying. Timeouts/disconnects never implicitly cancel remote work.
-
-See [the connection guide](docs/how-to-connect.md#select-a-session-workspace)
-for the complete selection workflow.
+A directory switch creates a **new session**: use its returned `sessionId`.
+The old ID remains unchanged; nothing implicitly closes or cancels its work.
+`new` and `prompt(new=true)` also bind cwd; continuing `prompt` can omit cwd.
+`status`, `inspect`, and `follow` reject directory changes. Unknown IDs require
+backend `session/list` metadata; missing or incomplete metadata fails closed.
+Paths are lexical POSIX paths on the QueryMT host, not a sandbox. Initial relative
+paths use qmcp's startup cwd; later ones use the session cwd. `~` is rejected;
+supply the backend's absolute home path. See [workspace details](docs/how-to-connect.md#select-a-session-workspace).
 
 ## Important Behavior
 
@@ -145,6 +89,10 @@ for the complete selection workflow.
   Check `droppedEvents` and `textTruncated` for incomplete output.
 - `find` scans at most 20 pages. Check `truncated` and `scanLimitReached` before
   treating its results as exhaustive.
+
+`inspect` still uses ACP `session/load`, which may restore runtime state; it is
+not a guaranteed read-only history API. A backend replay failure is a tool error,
+not empty history. No history endpoint or backend fix is supplied here.
 
 ## Development
 
