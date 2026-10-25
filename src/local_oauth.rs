@@ -2,7 +2,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 
@@ -30,7 +30,7 @@ use oxide_auth::{
         generator::RandomGenerator,
         grant::Grant,
         issuer::{IssuedToken, Issuer, RefreshedToken, TokenMap},
-        registrar::{Client, ClientMap, ExactUrl, Registrar},
+        registrar::{Client, ClientMap, ExactUrl},
     },
 };
 use serde::Deserialize;
@@ -68,7 +68,6 @@ struct Server {
 }
 
 struct Store {
-    clients: ClientMap,
     registrations: HashMap<String, (Client, Option<Instant>)>,
     registration_rate: (Instant, u8),
     codes: Codes,
@@ -93,16 +92,15 @@ impl Store {
                     .iter()
                     .any(|family| !family.revoked && &family.client_id == id)
         });
-        self.clients = self
-            .registrations
-            .values()
-            .map(|(client, _)| client.clone())
-            .collect();
     }
 
-    fn endpoint(&mut self) -> Generic<&ClientMap, &mut Codes, &mut Tokens> {
+    fn endpoint(&mut self) -> Generic<ClientMap, &mut Codes, &mut Tokens> {
         Generic {
-            registrar: &self.clients,
+            registrar: self
+                .registrations
+                .values()
+                .map(|(client, _)| client.clone())
+                .collect(),
             authorizer: &mut self.codes,
             issuer: &mut self.tokens,
             solicitor: Vacant,
@@ -268,6 +266,13 @@ impl LocalOAuth {
         Self::new(config, secret.strip_suffix('\n').unwrap_or(&secret))
     }
 
+    fn store(&self) -> Result<MutexGuard<'_, Store>, StatusCode> {
+        self.0
+            .store
+            .lock()
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+    }
+
     fn new(config: LocalOAuthConfig, secret: &str) -> Result<Self> {
         let resource = crate::oauth::https_url(&config.resource)?;
         if resource.path() != "/mcp"
@@ -299,17 +304,12 @@ impl LocalOAuth {
                 ),
             );
         }
-        let clients = registrations
-            .values()
-            .map(|(client, _)| client.clone())
-            .collect();
         Ok(Self(Arc::new(Server {
             issuer: resource.origin().ascii_serialization(),
             owner: digest(secret),
             config,
             readers: tokio::sync::Semaphore::new(16),
             store: Mutex::new(Store {
-                clients,
                 registrations,
                 registration_rate: (Instant::now(), 0),
                 codes: Codes::default(),
@@ -465,11 +465,7 @@ async fn register(
     let Ok(client) = public_client(&id, &metadata.redirect_uris) else {
         return Ok(invalid("invalid_redirect_uri"));
     };
-    let mut store = auth
-        .0
-        .store
-        .lock()
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let mut store = auth.store()?;
     if store.registration_rate.0.elapsed() >= Duration::from_secs(60) {
         store.registration_rate = (Instant::now(), 0);
     }
@@ -481,7 +477,6 @@ async fn register(
     if store.registrations.len() >= 128 {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
-    store.clients.register_client(client.clone());
     store.registrations.insert(
         id.clone(),
         (client, Some(Instant::now() + Duration::from_secs(3600))),
@@ -549,7 +544,7 @@ async fn guard(State(auth): State<LocalOAuth>, request: Request, next: Next) -> 
     }
     let oauth = request.uri().path().starts_with("/oauth/")
         || request.uri().path().starts_with("/.well-known/");
-    let mut response = if oauth {
+    let response = if oauth {
         if request.uri().to_string().len() > 8192
             || (request.method() == "POST" && request.uri().query().is_some())
         {
@@ -561,11 +556,7 @@ async fn guard(State(auth): State<LocalOAuth>, request: Request, next: Next) -> 
             .try_acquire()
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         {
-            let mut store = auth
-                .0
-                .store
-                .lock()
-                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+            let mut store = auth.store()?;
             store
                 .pending
                 .retain(|_, (_, expires)| *expires > Instant::now());
@@ -576,20 +567,19 @@ async fn guard(State(auth): State<LocalOAuth>, request: Request, next: Next) -> 
     } else {
         next.run(request).await
     };
-    for (name, value) in [
-        ("cache-control", "no-store"),
-        ("referrer-policy", "same-origin"),
-        ("x-content-type-options", "nosniff"),
-        (
-            "content-security-policy",
-            "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
-        ),
-    ] {
-        response
-            .headers_mut()
-            .insert(name, HeaderValue::from_static(value));
-    }
-    Ok(response)
+    Ok((
+        [
+            ("cache-control", "no-store"),
+            ("referrer-policy", "same-origin"),
+            ("x-content-type-options", "nosniff"),
+            (
+                "content-security-policy",
+                "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+            ),
+        ],
+        response,
+    )
+        .into_response())
 }
 
 async fn resource_metadata(State(auth): State<LocalOAuth>) -> Json<serde_json::Value> {
@@ -659,11 +649,7 @@ async fn authorize(
         escape(&request.query["redirect_uri"]),
         nonce
     );
-    let mut store = auth
-        .0
-        .store
-        .lock()
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let mut store = auth.store()?;
     if store.pending.len() >= 128 {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -719,11 +705,7 @@ async fn consent(
     if cookies.len() != 1 || !bool::from(digest(&cookies[0]).ct_eq(&digest(&form.transaction))) {
         return Err(StatusCode::FORBIDDEN);
     }
-    let mut store = auth
-        .0
-        .store
-        .lock()
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let mut store = auth.store()?;
     let (request, expires) = store
         .pending
         .remove(&digest(&form.transaction))
@@ -767,13 +749,9 @@ async fn exchange(
     {
         return Ok(invalid("invalid_request"));
     }
-    let mut store = auth
-        .0
-        .store
-        .lock()
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let mut store = auth.store()?;
     let client_id = body.get("client_id").ok_or(StatusCode::BAD_REQUEST)?;
-    if store.clients.check(client_id, None).is_err() {
+    if !store.registrations.contains_key(client_id) {
         return Ok(invalid("invalid_client"));
     }
     if body
@@ -821,7 +799,7 @@ async fn require_token(
     next: Next,
 ) -> HttpResult {
     let valid = crate::transport::bearer_credential(request.headers()).is_some_and(|token| {
-        let Ok(store) = auth.0.store.lock() else {
+        let Ok(store) = auth.store() else {
             return false;
         };
         store

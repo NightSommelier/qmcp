@@ -469,15 +469,9 @@ async fn dcr_limits_recover_without_evicting_active_clients() {
         coded.exchange(&code, VERIFIER, RESOURCE).await.status(),
         StatusCode::OK
     );
-    assert!(
-        app.auth
-            .0
-            .store
-            .lock()
-            .unwrap()
-            .clients
-            .check(&abandoned.client_id, None)
-            .is_err()
+    assert_eq!(
+        json(abandoned.exchange("unused-code", VERIFIER, RESOURCE).await).await["error"],
+        "invalid_client"
     );
     assert_eq!(
         app.exchange(&app.code().await, VERIFIER, RESOURCE)
