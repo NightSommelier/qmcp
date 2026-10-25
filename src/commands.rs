@@ -175,6 +175,7 @@ pub enum Command {
         timeout: u64,
         #[serde(default)]
         delivery: Delivery,
+        /// Wait for idle after submission, not proof the submitted task succeeded.
         #[serde(default = "default_true")]
         until_idle: bool,
     },
@@ -199,7 +200,7 @@ pub enum Command {
         #[serde(default = "default_true")]
         idle: bool,
     },
-    /// Steer an in-flight turn. Omit run_id to discover the active run.
+    /// Steer an in-flight turn. Omit run_id to discover it; a nonempty active run is required.
     Steer {
         session_id: String,
         run_id: Option<String>,
@@ -1203,23 +1204,31 @@ async fn prompt(
     selected.checkpoint(state);
     let session_id = selected.session_id.clone();
     let cwd = selected.binding.cwd.clone();
-    if !selected.created {
-        open_session(client, session_id.clone(), cwd.clone()).await?;
-    }
     // Keep the session id observable even if configuration or the prompt later fails.
     client
         .emit(json!({ "type": "session", "sessionId": session_id, "cwd": cwd }))
         .await;
-    apply_config(client, &session_id, mode, model, effort).await?;
+    state.recovery.insert("stage".into(), json!("configure"));
+    state
+        .recovery
+        .insert("deliveryState".into(), json!("not_submitted"));
     let chosen = if selected.created {
         Delivery::Prompt
     } else {
         choose_delivery(client, &session_id, delivery).await?
     };
+    if !selected.created && chosen == Delivery::Prompt {
+        open_session(client, session_id.clone(), cwd.clone()).await?;
+    }
+    apply_config(client, &session_id, mode, model, effort).await?;
     client.clear_assistant_text().await;
     let mut submitted = None;
     let stop_reason = match chosen {
         Delivery::Prompt => {
+            state.recovery.insert("stage".into(), json!("submit"));
+            state
+                .recovery
+                .insert("deliveryState".into(), json!("unknown"));
             let response = client
                 .prompt(session_id.clone(), text, Some(Duration::from_secs(86_400)))
                 .await
@@ -1242,6 +1251,10 @@ async fn prompt(
         }
         Delivery::Auto => unreachable!("auto is resolved before send"),
     };
+    state
+        .recovery
+        .insert("deliveryState".into(), json!("accepted"));
+    state.recovery.insert("stage".into(), json!("observe"));
     if until_idle {
         wait_until_idle(client, &session_id, Duration::from_secs(u32::MAX.into())).await?;
     }
@@ -1255,6 +1268,8 @@ async fn prompt(
             "stopReason": stop_reason,
             "text": text,
             "submitted": submitted,
+            "deliveryState": "accepted",
+            "observationState": if until_idle { "idle" } else if chosen == Delivery::Prompt { "prompt_returned" } else { "not_waited" },
             "loadSession": initialized.agent_capabilities.load_session,
         })
         .as_object()
@@ -1285,11 +1300,16 @@ async fn choose_delivery(
     let phase = state
         .pointer("/runtime/phase")
         .and_then(Value::as_str)
-        .unwrap_or("idle");
+        .filter(|phase| !phase.is_empty())
+        .ok_or_else(|| {
+            CliError::rpc("runtime response has no valid phase; input was not submitted")
+        })?;
     let steerable = state
         .pointer("/runtime/steerable")
         .and_then(Value::as_bool)
-        .unwrap_or(false);
+        .ok_or_else(|| {
+            CliError::rpc("runtime response has no valid steerable flag; input was not submitted")
+        })?;
     Ok(delivery_from_runtime(phase, steerable))
 }
 
@@ -1427,46 +1447,72 @@ async fn submit_input(
     run_id: Option<String>,
     text: String,
 ) -> Result<Value, CliError> {
+    state.recovery.insert("sessionId".into(), json!(session_id));
+    state.recovery.insert("stage".into(), json!("submit"));
+    state
+        .recovery
+        .insert("deliveryState".into(), json!("not_submitted"));
     client.initialize().await.map_err(CliError::from_request)?;
-    let run_id = if method.ends_with("/steer") && run_id.is_none() {
-        runtime(client, session_id.clone())
-            .await?
-            .pointer("/runtime/active_run_id")
-            .and_then(Value::as_str)
-            .map(str::to_string)
+    let delivery = if method.ends_with("/steer") {
+        "steer"
+    } else {
+        "queue"
+    };
+    let run_id = if delivery == "steer" {
+        let run_id = match run_id {
+            Some(id) => Some(id),
+            None => runtime(client, session_id.clone())
+                .await?
+                .pointer("/runtime/active_run_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        };
+        Some(run_id.filter(|id| !id.trim().is_empty()).ok_or_else(|| {
+            CliError::rpc(
+                "steer requires an active run or a nonempty run_id; input was not submitted",
+            )
+        })?)
     } else {
         run_id
     };
     let client_input_id = uuid::Uuid::new_v4().to_string();
-    state.submission_started(
-        &session_id,
-        &client_input_id,
-        if method.ends_with("/steer") {
-            "steer"
-        } else {
-            "queue"
-        },
-    );
+    state.submission_started(&session_id, &client_input_id, delivery);
     let mut params = json!({
         "session_id": session_id,
         "client_input_id": client_input_id,
         "prompt": [{ "type": "text", "text": text }],
     });
     if let Some(run_id) = run_id {
-        params
-            .as_object_mut()
-            .expect("params object")
-            .insert("expected_run_id".to_string(), json!(run_id));
+        params["expected_run_id"] = json!(run_id);
     }
     let response = client
         .extension(method, params)
         .await
         .map_err(CliError::from_request)?;
     let acknowledgement = extension_payload(&response);
+    if acknowledgement.get("input_id").and_then(Value::as_str) != Some(client_input_id.as_str())
+        || !matches!(
+            response.get("status").and_then(Value::as_str),
+            Some("queued" | "started" | "steered")
+        )
+        || response.get("ok") == Some(&Value::Bool(false))
+        || acknowledgement.get("ok") == Some(&Value::Bool(false))
+    {
+        return Err(CliError::rpc(
+            "invalid submission receipt; acceptance is unknown; inspect before retrying",
+        ));
+    }
     state.submission_acknowledged(&acknowledgement);
+    client
+        .emit(json!({
+            "type": "submitted", "sessionId": session_id, "clientInputId": client_input_id,
+            "delivery": delivery, "deliveryState": "accepted", "result": acknowledgement,
+        }))
+        .await;
     Ok(json!({
         "sessionId": session_id,
         "clientInputId": client_input_id,
+        "deliveryState": "accepted",
         "result": acknowledgement,
     }))
 }

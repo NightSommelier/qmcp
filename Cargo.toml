@@ -2,7 +2,7 @@
 name = "qmcp"
 description = "MCP server for controlling a running QueryMT ACP WebSocket server."
 authors = ["Ivan Zatevakhin <ivan@query.mt>"]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 readme = "README.md"
@@ -19,7 +19,7 @@ form_urlencoded = "1.2"
 getrandom = "0.4"
 libc = "0.2"
 clap = { version = "4", features = ["derive", "env"] }
-qmacp = { git = "https://github.com/querymt/qmacp", tag = "v0.1.1" }
+qmacp = { git = "https://github.com/querymt/qmacp", tag = "v0.1.2" }
 reqwest = { version = "0.13", default-features = false, features = ["json", "form", "rustls"] }
 rmcp = { version = "3.6", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
 schemars = "1"
