@@ -45,7 +45,6 @@ impl BridgeConfig {
 pub struct QmcpServer {
     config: Arc<BridgeConfig>,
     tools: Arc<Vec<Tool>>,
-    workspaces: Arc<crate::workspace::Workspaces>,
 }
 
 impl QmcpServer {
@@ -54,7 +53,6 @@ impl QmcpServer {
         Ok(Self {
             config: Arc::new(config),
             tools: Arc::new(tool_catalog()?),
-            workspaces: Arc::new(crate::workspace::Workspaces::new()?),
         })
     }
 
@@ -94,7 +92,7 @@ impl QmcpServer {
         let mut log = EventLog::default();
         let mut state = OperationState::default();
         let result = {
-            let operation = commands::run(&client, command, &mut state, deadline, &self.workspaces);
+            let operation = commands::run(&client, command, &mut state, deadline);
             tokio::pin!(operation);
             loop {
                 tokio::select! {
@@ -119,7 +117,7 @@ impl ServerHandler for QmcpServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("qmcp", env!("CARGO_PKG_VERSION")))
-            .with_instructions("Control an existing QueryMT ACP WebSocket server. Discover capabilities, profiles, models, and session ids rather than inventing values. Keep returned sessionId values and pass them as session_id; there is no global active workspace. Use workspace with an explicit initial cwd to select without prompting. cwd is sticky per session across calls. workspace or prompt with a different cwd creates a NEW QueryMT session; use its new sessionId, not previousSessionId. Read-only status/inspect/follow never rebind or create sessions. Timeouts and MCP cancellation do not cancel remote work: check runtime before retrying. Only close sessions when explicitly requested. Streaming ACP events are collected in each tool result.")
+            .with_instructions("Control an existing QueryMT ACP WebSocket server. Discover capabilities, profiles, models, and session ids rather than inventing values. Keep returned sessionId values. For existing sessions, omit cwd to use backend metadata. Choose cwd when creating a session; create a new session to change projects. Timeouts and MCP cancellation do not cancel remote work: check runtime before retrying. Only close sessions when explicitly requested. Events and assistant text are returned in tool results, not streamed live.")
     }
 
     async fn list_tools(
@@ -181,30 +179,17 @@ fn tool_catalog() -> Result<Vec<Tool>> {
             .context("tool must have a description")?;
         let read_only = matches!(
             name.as_str(),
-            "caps"
-                | "profiles"
-                | "models"
-                | "sessions"
-                | "find"
-                | "get_lifecycle"
-                | "inspect"
-                | "status"
-                | "runtime"
-                | "follow"
-                | "watch"
+            "caps" | "profiles" | "sessions" | "find" | "get_lifecycle" | "runtime" | "watch"
         );
         let idempotent = read_only
             || matches!(
                 name.as_str(),
                 "set_lifecycle" | "pin" | "unpin" | "set_mode" | "set_model" | "set_effort"
             );
-        let mut annotations = ToolAnnotations::new()
+        let annotations = ToolAnnotations::new()
             .read_only(read_only)
             .idempotent(idempotent)
             .open_world(true);
-        if name == "workspace" {
-            annotations = annotations.destructive(false);
-        }
         tools.push(Tool::new(name, description, input).with_annotations(annotations));
     }
     if tools.is_empty() {
@@ -279,9 +264,6 @@ mod tests {
                         json!({"protocolVersion": 1, "agentCapabilities": {"loadSession": true, "sessionCapabilities": {"resume": {}}}})
                     }
                     "session/resume" | "session/load" => json!({}),
-                    "session/list" => {
-                        json!({"sessions": [{"sessionId": "fixture-session", "cwd": "/workspace"}]})
-                    }
                     "_querymt/session/runtimeState" if input_id.is_null() => {
                         json!({"phase": "tools", "steerable": true})
                     }
@@ -342,100 +324,6 @@ mod tests {
             result["recovery"]["submission"]["acknowledgement"]["input_id"],
             input_id
         );
-    }
-
-    #[tokio::test]
-    async fn cancelled_creation_keeps_workspace_binding_across_server_clones() {
-        use futures_util::{SinkExt, StreamExt};
-        use std::time::Duration;
-        use tokio_tungstenite::{accept_async, tungstenite::Message};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("ws://{}/acp/ws", listener.local_addr().unwrap());
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        let peer = tokio::spawn(async move {
-            let mut ready = Some(ready_tx);
-            for _ in 0..2 {
-                let (socket, _) = listener.accept().await.unwrap();
-                let mut socket = accept_async(socket).await.unwrap();
-                while let Some(Ok(message)) = socket.next().await {
-                    let Message::Text(text) = message else {
-                        continue;
-                    };
-                    let request: Value = serde_json::from_str(&text).unwrap();
-                    let result = match request["method"].as_str().unwrap() {
-                        "initialize" => {
-                            json!({"protocolVersion": 1, "agentCapabilities": {"loadSession": true, "sessionCapabilities": {"resume": {}}}})
-                        }
-                        "session/new" => {
-                            assert_eq!(request["params"]["cwd"], "/remote/cancelled-creation");
-                            json!({"sessionId": "created-before-cancellation"})
-                        }
-                        "session/set_mode" => {
-                            // Creation was acknowledged and configuration now stalls.
-                            ready.take().unwrap().send(()).unwrap();
-                            continue;
-                        }
-                        "session/resume" | "session/load" => {
-                            assert_eq!(request["params"]["cwd"], "/remote/cancelled-creation");
-                            assert_eq!(
-                                request["params"]["sessionId"],
-                                "created-before-cancellation"
-                            );
-                            json!({})
-                        }
-                        _ => panic!(
-                            "no rediscovery, implicit cancel, close, or extra creation: {request}"
-                        ),
-                    };
-                    socket
-                        .send(Message::Text(
-                            json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
-                                .to_string()
-                                .into(),
-                        ))
-                        .await
-                        .unwrap();
-                }
-            }
-        });
-        let server =
-            QmcpServer::new(BridgeConfig::new(&url, false, PermissionPolicy::Cancel).unwrap())
-                .unwrap();
-        let clone = server.clone();
-        assert!(Arc::ptr_eq(&server.workspaces, &clone.workspaces));
-        let command = commands::decode("prompt", json!({"new": true, "cwd": "/remote/cancelled-creation", "text": "not sent", "mode": "stall"}).as_object().unwrap().clone()).unwrap();
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
-            server.execute_with_cancellation(command, async {
-                ready_rx.await.unwrap();
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(result["ok"], false, "{result}");
-        assert_eq!(
-            result["recovery"]["sessionId"],
-            "created-before-cancellation"
-        );
-        assert_eq!(result["recovery"]["sessionCreated"], true);
-        let command = commands::decode(
-            "status",
-            json!({"session_id": "created-before-cancellation"})
-                .as_object()
-                .unwrap()
-                .clone(),
-        )
-        .unwrap();
-        let result = clone
-            .execute_with_cancellation(command, std::future::pending())
-            .await;
-        assert_eq!(result["ok"], true, "{result}");
-        assert_eq!(result["cwd"], "/remote/cancelled-creation");
-        tokio::time::timeout(Duration::from_secs(2), peer)
-            .await
-            .unwrap()
-            .unwrap();
     }
 
     #[test]
@@ -556,31 +444,54 @@ mod tests {
         ] {
             check("exec", json!({"calls": [entry]}));
         }
-        for arguments in [
-            json!({}),
-            json!({"session_id": null}),
-            json!({"cwd": null}),
-            json!({"cwd": "/remote"}),
-            json!({"session_id": "s"}),
-            json!({"session_id": "s", "cwd": null}),
-            json!({"session_id": "s", "cwd": "/remote", "profile": "p"}),
-            json!({"session_id": "s", "extra": true}),
-        ] {
-            check("workspace", arguments);
-        }
-        check(
-            "exec",
-            json!({"calls": [{"name": "workspace", "arguments": {"cwd": "/remote"}}]}),
-        );
-        check("exec", json!({"calls": [{"name": "workspace"}]}));
         check("prompt", json!({"new": true, "text": "x", "extra": true}));
         check("caps", json!({"extra": true}));
     }
 
     #[test]
+    fn session_guidance_and_schemas_use_backend_cwd_by_default() {
+        let server = QmcpServer::new(
+            BridgeConfig::new(
+                "ws://127.0.0.1:3030/acp/ws",
+                false,
+                PermissionPolicy::Cancel,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(server.get_info().instructions.unwrap().contains("omit cwd"));
+        for name in ["prompt", "status", "inspect", "follow"] {
+            let tool = server.get_tool(name).unwrap();
+            let mut args = json!({"session_id": "existing-session"});
+            if name == "prompt" {
+                args["text"] = json!("continue");
+            }
+            assert!(
+                jsonschema::validator_for(&json!(tool.input_schema))
+                    .unwrap()
+                    .is_valid(&args),
+                "{name}"
+            );
+            assert!(commands::decode(name, args.as_object().unwrap().clone()).is_ok());
+            assert!(
+                tool.input_schema["properties"]["cwd"]["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("backend metadata"),
+                "{name}"
+            );
+        }
+        for name in ["inspect", "status", "follow", "models"] {
+            let annotations = server.get_tool(name).unwrap().annotations.unwrap();
+            assert_eq!(annotations.read_only_hint, Some(false), "{name}");
+            assert_eq!(annotations.idempotent_hint, Some(false), "{name}");
+        }
+    }
+
+    #[test]
     fn catalog_contains_self_contained_object_schemas_and_native_prompt_fields() {
         let tools = tool_catalog().unwrap();
-        assert_eq!(tools.len(), 26);
+        assert_eq!(tools.len(), 25);
         for tool in &tools {
             assert_eq!(tool.input_schema["type"], "object");
             assert!(
@@ -595,11 +506,6 @@ mod tests {
                     .contains("\"$ref\"")
             );
         }
-        let workspace = tools.iter().find(|t| t.name == "workspace").unwrap();
-        let annotations = json!(workspace.annotations);
-        assert_eq!(annotations["readOnlyHint"], false);
-        assert_eq!(annotations["destructiveHint"], false);
-        assert_eq!(annotations["idempotentHint"], false);
         let prompt = tools.iter().find(|t| t.name == "prompt").unwrap();
         assert_eq!(prompt.input_schema["properties"]["text"]["type"], "string");
         assert_eq!(

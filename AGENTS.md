@@ -17,8 +17,8 @@
 - The project, crate and binary are named `qmcp` (lowercase).
 - `src/main.rs` configures the server; `server.rs` exposes MCP tools and
   `commands.rs` implements their ACP operations using the qmacp client library.
-- `transport.rs` handles stdio/Streamable HTTP; `oauth.rs` handles provider OAuth;
-  `output.rs` assembles tool results, bounded events and recovery information.
+- `transport.rs` handles stdio/Streamable HTTP; `oauth.rs` and `local_oauth.rs`
+  handle external and embedded OAuth; `output.rs` assembles results and recovery.
 - `tests/bridge.rs` exercises the MCP-to-ACP bridge with mocks. `README.md` and
   `docs/how-to-connect.md` cover user setup; avoid duplicating their content.
 
@@ -57,10 +57,10 @@
 
 - Support only stdio and Streamable HTTP. Keep stdout exclusively for MCP JSON-RPC
   in stdio mode; use stderr for diagnostics and never log credentials.
-- Require static Bearer or external-provider OAuth authentication for non-loopback
-  HTTP binds; preserve Host/Origin validation.
-- Keep OAuth minimal: resource discovery and token introspection only. Login,
-  PKCE, consent and token issuance belong to the provider.
+- Require authentication for non-loopback HTTP binds; preserve Host/Origin
+  validation and the existing Bearer, external OAuth, and embedded OAuth modes.
+- Existing sessions use backend cwd metadata by default. Do not require callers
+  to repeat cwd or silently create/rebind sessions to change projects.
 - Timeout, disconnect and MCP cancellation must not implicitly close sessions or
   cancel remote work. Retain submission/recovery information on failure.
 - Follow surrounding code, rustfmt and existing error conventions.
