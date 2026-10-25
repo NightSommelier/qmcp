@@ -45,8 +45,8 @@
   ```sh
   cargo check -p qmcp --tests
   cargo test -p qmcp --test bridge <test_filter>
-  cargo fmt -p qmcp -- --check
-  cargo clippy -p qmcp --all-targets -- -D warnings
+  cargo fmt --all -- --check
+  cargo clippy --all-targets --all-features -- -D warnings
   ```
 - Tests must not connect to the user's running server. Load/resume can restore
   runtime state; do not treat them as harmless history reads.
