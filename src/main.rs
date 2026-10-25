@@ -64,7 +64,7 @@ struct Cli {
     )]
     oauth_client_secret: Option<String>,
 
-    /// Embedded single-owner OAuth JSON: resource, client_id, redirect_uri, owner_secret_file.
+    /// Embedded OAuth JSON: resource, owner_secret_file; optional client_id/redirect_uri pair.
     #[arg(long, conflicts_with_all = ["bearer_token", "oauth_config", "oauth_client_secret"])]
     oauth_local_config: Option<PathBuf>,
 

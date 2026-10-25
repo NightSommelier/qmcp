@@ -1,4 +1,4 @@
-//! Single-owner OAuth with a preconfigured public client. State is lost on restart.
+//! Single-owner OAuth with public-client registration. State is lost on restart.
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -30,7 +30,7 @@ use oxide_auth::{
         generator::RandomGenerator,
         grant::Grant,
         issuer::{IssuedToken, Issuer, RefreshedToken, TokenMap},
-        registrar::{Client, ClientMap, ExactUrl},
+        registrar::{Client, ClientMap, ExactUrl, Registrar},
     },
 };
 use serde::Deserialize;
@@ -43,12 +43,14 @@ const COOKIE: &str = "__Host-qmcp-consent";
 type Digest32 = [u8; 32];
 type HttpResult = std::result::Result<Response, StatusCode>;
 
-/// Settings for --oauth-local-config. Copy the exact callback from the MCP client.
+/// Settings for --oauth-local-config. A preconfigured client/callback pair is optional.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalOAuthConfig {
     pub resource: String,
+    #[serde(default)]
     pub client_id: String,
+    #[serde(default)]
     pub redirect_uri: String,
     pub owner_secret_file: PathBuf,
 }
@@ -67,12 +69,37 @@ struct Server {
 
 struct Store {
     clients: ClientMap,
+    registrations: HashMap<String, (Client, Option<Instant>)>,
+    registration_rate: (Instant, u8),
     codes: Codes,
     tokens: Tokens,
     pending: HashMap<Digest32, (OAuthRequest, Instant)>,
 }
 
 impl Store {
+    fn prune_clients(&mut self) {
+        self.tokens.prune();
+        let now = Utc::now();
+        self.codes.0.retain(|_, grant| grant.until > now);
+        self.registrations.retain(|id, (_, expires)| {
+            expires.is_none_or(|expiry| expiry > Instant::now())
+                || self.codes.0.values().any(|grant| &grant.client_id == id)
+                || self.pending.values().any(|(request, expiry)| {
+                    *expiry > Instant::now() && request.query.get("client_id") == Some(id)
+                })
+                || self
+                    .tokens
+                    .families
+                    .iter()
+                    .any(|family| !family.revoked && &family.client_id == id)
+        });
+        self.clients = self
+            .registrations
+            .values()
+            .map(|(client, _)| client.clone())
+            .collect();
+    }
+
     fn endpoint(&mut self) -> Generic<&ClientMap, &mut Codes, &mut Tokens> {
         Generic {
             registrar: &self.clients,
@@ -125,6 +152,7 @@ impl Authorizer for Codes {
 }
 
 struct Family {
+    client_id: String,
     current: IssuedToken,
     expires: DateTime<Utc>,
     used: HashSet<Digest32>,
@@ -150,12 +178,12 @@ impl Tokens {
         });
     }
 
-    // Called only after validating the configured client, resource and scope.
-    fn replayed(&mut self, refresh: &str) -> bool {
+    // Replaying another client's token must not revoke that client's grant.
+    fn replayed(&mut self, client_id: &str, refresh: &str) -> bool {
         let Some(family) = self
             .families
             .iter_mut()
-            .find(|f| f.used.contains(&digest(refresh)))
+            .find(|f| f.client_id == client_id && f.used.contains(&digest(refresh)))
         else {
             return false;
         };
@@ -175,8 +203,10 @@ impl Issuer for Tokens {
             return Err(());
         }
         grant.until = Utc::now() + chrono::Duration::minutes(30);
+        let client_id = grant.client_id.clone();
         let token = self.inner.issue(grant)?;
         self.families.push(Family {
+            client_id,
             current: token.clone(),
             expires: Utc::now() + chrono::Duration::hours(24),
             used: HashSet::new(),
@@ -240,10 +270,9 @@ impl LocalOAuth {
 
     fn new(config: LocalOAuthConfig, secret: &str) -> Result<Self> {
         let resource = crate::oauth::https_url(&config.resource)?;
-        crate::oauth::https_url(&config.redirect_uri)?;
         if resource.path() != "/mcp"
             || resource.as_str() != config.resource
-            || config.client_id.is_empty()
+            || config.client_id.is_empty() != config.redirect_uri.is_empty()
             || config.client_id.len() > 128
             || !config
                 .client_id
@@ -251,18 +280,29 @@ impl LocalOAuth {
                 .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
         {
             bail!(
-                "embedded OAuth requires a canonical HTTPS /mcp resource, safe client ID and exact HTTPS callback"
+                "embedded OAuth requires a canonical HTTPS /mcp resource and optional client ID/callback pair"
             );
         }
         if secret.len() != 64 || !secret.bytes().all(|b| b.is_ascii_hexdigit()) {
             bail!("OAuth owner secret must be 32 random bytes encoded as 64 hex characters");
         }
-        let mut clients = ClientMap::new();
-        clients.register_client(Client::public(
-            &config.client_id,
-            config.redirect_uri.parse::<ExactUrl>()?.into(),
-            SCOPE.parse()?,
-        ));
+        let mut registrations = HashMap::new();
+        if !config.client_id.is_empty() {
+            registrations.insert(
+                config.client_id.clone(),
+                (
+                    public_client(
+                        &config.client_id,
+                        std::slice::from_ref(&config.redirect_uri),
+                    )?,
+                    None,
+                ),
+            );
+        }
+        let clients = registrations
+            .values()
+            .map(|(client, _)| client.clone())
+            .collect();
         Ok(Self(Arc::new(Server {
             issuer: resource.origin().ascii_serialization(),
             owner: digest(secret),
@@ -270,6 +310,8 @@ impl LocalOAuth {
             readers: tokio::sync::Semaphore::new(16),
             store: Mutex::new(Store {
                 clients,
+                registrations,
+                registration_rate: (Instant::now(), 0),
                 codes: Codes::default(),
                 tokens: Tokens {
                     inner: TokenMap::new(RandomGenerator::new(32)),
@@ -301,6 +343,7 @@ impl LocalOAuth {
                         "/.well-known/oauth-authorization-server",
                         get(server_metadata),
                     )
+                    .route("/oauth/register", post(register))
                     .route("/oauth/authorize", get(authorize))
                     .route("/oauth/consent", post(consent))
                     .route("/oauth/token", post(exchange))
@@ -336,6 +379,120 @@ fn read_owner_secret(path: &std::path::Path) -> Result<String> {
 #[cfg(not(unix))]
 fn read_owner_secret(_path: &std::path::Path) -> Result<String> {
     bail!("embedded OAuth requires Unix secret-file permissions")
+}
+
+fn public_client(id: &str, callbacks: &[String]) -> Result<Client> {
+    if callbacks.is_empty() || callbacks.len() > 8 {
+        bail!("invalid redirect URI count");
+    }
+    let mut redirects = Vec::new();
+    for callback in callbacks {
+        let url = reqwest::Url::parse(callback)?;
+        let loopback = url.host_str().is_some_and(|host| {
+            host == "localhost"
+                || host
+                    .trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        });
+        if callback.len() > 2048
+            || url.host_str().is_none()
+            || !(url.scheme() == "https" || (url.scheme() == "http" && loopback))
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+            || url.as_str() != callback
+            || url.query_pairs().any(|(key, _)| {
+                matches!(
+                    key.as_ref(),
+                    "code" | "state" | "iss" | "error" | "error_description"
+                )
+            })
+        {
+            bail!("invalid redirect URI");
+        }
+        redirects.push(callback.parse::<ExactUrl>()?.into());
+    }
+    Ok(Client::public(id, redirects.remove(0), SCOPE.parse()?)
+        .with_additional_redirect_uris(redirects))
+}
+
+#[derive(Deserialize)]
+struct Registration {
+    redirect_uris: Vec<String>,
+    client_name: Option<String>,
+    token_endpoint_auth_method: Option<String>,
+    grant_types: Option<Vec<String>>,
+    response_types: Option<Vec<String>>,
+    scope: Option<String>,
+}
+
+async fn register(
+    State(auth): State<LocalOAuth>,
+    metadata: std::result::Result<Json<Registration>, axum::extract::rejection::JsonRejection>,
+) -> HttpResult {
+    let metadata = match metadata {
+        Ok(Json(metadata)) => metadata,
+        Err(error) if error.status() == StatusCode::PAYLOAD_TOO_LARGE => return Err(error.status()),
+        Err(_) => return Ok(invalid("invalid_client_metadata")),
+    };
+    if metadata
+        .token_endpoint_auth_method
+        .as_deref()
+        .is_some_and(|method| method != "none")
+        || metadata.grant_types.as_ref().is_some_and(|grants| {
+            !grants.iter().any(|g| g == "authorization_code")
+                || grants
+                    .iter()
+                    .any(|g| g != "authorization_code" && g != "refresh_token")
+        })
+        || metadata
+            .response_types
+            .as_ref()
+            .is_some_and(|types| types != &["code"])
+        || metadata
+            .scope
+            .as_deref()
+            .is_some_and(|scope| scope != SCOPE)
+        || metadata
+            .client_name
+            .as_ref()
+            .is_some_and(|name| name.len() > 128)
+    {
+        return Ok(invalid("invalid_client_metadata"));
+    }
+    let id = random();
+    let Ok(client) = public_client(&id, &metadata.redirect_uris) else {
+        return Ok(invalid("invalid_redirect_uri"));
+    };
+    let mut store = auth
+        .0
+        .store
+        .lock()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    if store.registration_rate.0.elapsed() >= Duration::from_secs(60) {
+        store.registration_rate = (Instant::now(), 0);
+    }
+    if store.registration_rate.1 >= 10 {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    store.registration_rate.1 += 1;
+    store.prune_clients();
+    if store.registrations.len() >= 128 {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    store.clients.register_client(client.clone());
+    store.registrations.insert(
+        id.clone(),
+        (client, Some(Instant::now() + Duration::from_secs(3600))),
+    );
+    let mut response = json!({"client_id": id, "client_id_issued_at": Utc::now().timestamp(),
+        "redirect_uris": metadata.redirect_uris, "token_endpoint_auth_method": "none",
+        "grant_types": ["authorization_code", "refresh_token"], "response_types": ["code"], "scope": SCOPE});
+    if let Some(name) = metadata.client_name {
+        response["client_name"] = json!(name);
+    }
+    Ok((StatusCode::CREATED, Json(response)).into_response())
 }
 
 fn pkce() -> AddonList {
@@ -446,6 +603,7 @@ async fn server_metadata(State(auth): State<LocalOAuth>) -> Json<serde_json::Val
         json!({"issuer": auth.0.issuer, "authorization_response_iss_parameter_supported": true,
         "authorization_endpoint": format!("{}/oauth/authorize", auth.0.issuer),
         "token_endpoint": format!("{}/oauth/token", auth.0.issuer),
+        "registration_endpoint": format!("{}/oauth/register", auth.0.issuer),
         "response_types_supported": ["code"], "grant_types_supported": ["authorization_code", "refresh_token"],
         "token_endpoint_auth_methods_supported": ["none"], "code_challenge_methods_supported": ["S256"],
         "scopes_supported": [SCOPE]}),
@@ -480,7 +638,9 @@ async fn authorize(
     Query(pairs): Query<Vec<(String, String)>>,
 ) -> HttpResult {
     let query = fields(pairs)?;
-    if query.get("resource") != Some(&auth.0.config.resource)
+    if !query.contains_key("client_id")
+        || !query.contains_key("redirect_uri")
+        || query.get("resource") != Some(&auth.0.config.resource)
         || query.get("scope").is_some_and(|s| s != SCOPE)
         || ["owner", "password", "client_secret", "access_token"]
             .iter()
@@ -495,8 +655,8 @@ async fn authorize(
     let nonce = random();
     let page = format!(
         "<!doctype html><title>Authorize qmcp</title><h1>Authorize qmcp</h1><p>Allow {} to control this QueryMT instance. Callback: {}</p><form method=post action=/oauth/consent><input type=hidden name=transaction value=\"{}\"><label>Owner secret <input type=password name=owner required autocomplete=off></label><button name=decision value=approve>Log in and approve</button><button name=decision value=deny formnovalidate>Deny</button></form>",
-        escape(&auth.0.config.client_id),
-        escape(&auth.0.config.redirect_uri),
+        escape(&request.query["client_id"]),
+        escape(&request.query["redirect_uri"]),
         nonce
     );
     let mut store = auth
@@ -599,7 +759,6 @@ async fn exchange(
     let body = fields(pairs)?;
     let refresh = body.get("grant_type").is_some_and(|g| g == "refresh_token");
     if headers.contains_key(header::AUTHORIZATION)
-        || body.get("client_id") != Some(&auth.0.config.client_id)
         || body
             .get("resource")
             .map_or(!refresh, |r| r != &auth.0.config.resource)
@@ -613,11 +772,31 @@ async fn exchange(
         .store
         .lock()
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let client_id = body.get("client_id").ok_or(StatusCode::BAD_REQUEST)?;
+    if store.clients.check(client_id, None).is_err() {
+        return Ok(invalid("invalid_client"));
+    }
+    if body
+        .get("code")
+        .and_then(|code| store.codes.0.get(&digest(code)))
+        .is_some_and(|grant| &grant.client_id != client_id)
+    {
+        return Ok(invalid("invalid_grant"));
+    }
     store.tokens.prune();
+    // oxide-auth's public-client refresh path does not bind the body client_id.
     if refresh
         && body
             .get("refresh_token")
-            .is_some_and(|token| store.tokens.replayed(token))
+            .and_then(|token| store.tokens.recover_refresh(token).ok().flatten())
+            .is_some_and(|grant| &grant.client_id != client_id)
+    {
+        return Ok(invalid("invalid_grant"));
+    }
+    if refresh
+        && body
+            .get("refresh_token")
+            .is_some_and(|token| store.tokens.replayed(client_id, token))
     {
         return Ok(invalid("invalid_grant"));
     }

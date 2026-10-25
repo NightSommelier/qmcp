@@ -28,6 +28,7 @@ async fn json(response: Response) -> serde_json::Value {
 struct App {
     auth: LocalOAuth,
     router: Router,
+    client_id: String,
 }
 impl App {
     fn new() -> Self {
@@ -39,7 +40,11 @@ impl App {
                 "protected"
             }),
         ));
-        Self { auth, router }
+        Self {
+            auth,
+            router,
+            client_id: "qmcp-chatgpt".into(),
+        }
     }
     async fn call(
         &self,
@@ -63,9 +68,36 @@ impl App {
         }
         self.router.clone().oneshot(request).await.unwrap()
     }
+    async fn register(&self, metadata: serde_json::Value) -> Response {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/oauth/register")
+            .header("host", self.auth.authority())
+            .header("content-type", "application/json")
+            .body(HttpBody::from(metadata.to_string()))
+            .unwrap();
+        self.router.clone().oneshot(request).await.unwrap()
+    }
+    async fn dynamic(&self) -> Self {
+        let response = self
+            .register(
+                json!({"redirect_uris": [CALLBACK], "token_endpoint_auth_method": "none",
+            "grant_types": ["authorization_code", "refresh_token"]}),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let registered = json(response).await;
+        assert_eq!(registered["token_endpoint_auth_method"], "none");
+        assert!(registered.get("client_secret").is_none());
+        Self {
+            auth: self.auth.clone(),
+            router: self.router.clone(),
+            client_id: registered["client_id"].as_str().unwrap().into(),
+        }
+    }
     async fn begin(&self) -> (String, String) {
         let params = [
-            ("client_id", "qmcp-chatgpt"),
+            ("client_id", self.client_id.as_str()),
             ("redirect_uri", CALLBACK),
             ("response_type", "code"),
             ("scope", SCOPE),
@@ -92,6 +124,7 @@ impl App {
         assert!(
             html.contains(&nonce) && html.contains("Log in and approve") && html.contains(CALLBACK)
         );
+        assert!(html.contains(&self.client_id));
         assert!(!html.contains(OWNER));
         (cookie, nonce)
     }
@@ -139,7 +172,7 @@ impl App {
             "/oauth/token",
             &[
                 ("grant_type", "authorization_code"),
-                ("client_id", "qmcp-chatgpt"),
+                ("client_id", self.client_id.as_str()),
                 ("redirect_uri", CALLBACK),
                 ("resource", resource),
                 ("code", code),
@@ -157,7 +190,7 @@ impl App {
     async fn refresh(&self, token: &str, resource: Option<&str>) -> Response {
         let mut fields = vec![
             ("grant_type", "refresh_token"),
-            ("client_id", "qmcp-chatgpt"),
+            ("client_id", self.client_id.as_str()),
             ("refresh_token", token),
         ];
         if let Some(resource) = resource {
@@ -222,9 +255,12 @@ async fn discovery_consent_pkce_and_protected_access_work() {
         discovery["code_challenge_methods_supported"],
         json!(["S256"])
     );
-    assert!(discovery.get("registration_endpoint").is_none());
+    assert_eq!(
+        discovery["registration_endpoint"],
+        "https://mcp.example.com/oauth/register"
+    );
     let actual = std::mem::replace(&mut app.router, fake);
-    let tokens = app.tokens().await;
+    let tokens = app.dynamic().await.tokens().await;
     assert_eq!(tokens["token_type"], "bearer");
     assert_eq!(tokens["scope"], SCOPE);
     assert!(tokens["expires_in"].as_i64().unwrap() <= 1800);
@@ -266,6 +302,188 @@ async fn discovery_consent_pkce_and_protected_access_work() {
             .access(tokens["access_token"].as_str().unwrap())
             .await,
         StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn dcr_clients_complete_pkce_and_cannot_use_each_others_grants() {
+    let mut app = App::new();
+    app.auth = LocalOAuth::new(
+        serde_json::from_value(json!({
+            "resource": RESOURCE, "owner_secret_file": "unused",
+        }))
+        .unwrap(),
+        OWNER,
+    )
+    .unwrap();
+    app.router = app
+        .auth
+        .router(Router::new().route("/mcp", get(|| async { "protected" })));
+    let a = app.dynamic().await;
+    let b = app.dynamic().await;
+    assert_ne!(a.client_id, b.client_id);
+    let wrong_callback = a
+        .call(
+            "GET",
+            &format!(
+                "/oauth/authorize?{}",
+                encoded(&[
+                    ("client_id", &a.client_id),
+                    ("redirect_uri", "https://other.example/callback"),
+                    ("response_type", "code"),
+                    ("resource", RESOURCE),
+                    ("code_challenge_method", "S256"),
+                    ("code_challenge", CHALLENGE),
+                ])
+            ),
+            &[],
+            &[],
+        )
+        .await;
+    assert!(!wrong_callback.headers().contains_key(header::SET_COOKIE));
+    let code = a.code().await;
+    assert_eq!(
+        b.exchange(&code, VERIFIER, RESOURCE).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    let response = a.exchange(&code, VERIFIER, RESOURCE).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let first = json(response).await;
+    let old = first["refresh_token"].as_str().unwrap();
+    assert_eq!(b.refresh(old, None).await.status(), StatusCode::BAD_REQUEST);
+    let rotated = json(a.refresh(old, None).await).await;
+    assert_eq!(b.refresh(old, None).await.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        a.access(rotated["access_token"].as_str().unwrap()).await,
+        StatusCode::OK
+    );
+    assert_eq!(a.refresh(old, None).await.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        a.access(rotated["access_token"].as_str().unwrap()).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        b.access(b.tokens().await["access_token"].as_str().unwrap())
+            .await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn dcr_rejects_unsafe_or_unsupported_metadata() {
+    let app = App::new();
+    for change in [
+        json!({"redirect_uris": []}),
+        json!({"redirect_uris": ["https://evil.example/cb#fragment"]}),
+        json!({"redirect_uris": ["http://public.example/cb"]}),
+        json!({"redirect_uris": ["https://user:pass@example.com/cb"]}),
+        json!({"token_endpoint_auth_method": "client_secret_basic"}),
+        json!({"grant_types": ["client_credentials"]}),
+        json!({"response_types": ["token"]}),
+        json!({"scope": "admin"}),
+    ] {
+        let mut metadata =
+            json!({"redirect_uris": [CALLBACK], "token_endpoint_auth_method": "none"});
+        metadata
+            .as_object_mut()
+            .unwrap()
+            .extend(change.as_object().unwrap().clone());
+        let response = app.register(metadata).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            json(response).await["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("invalid_")
+        );
+    }
+    let request = Request::builder()
+        .method("POST")
+        .uri("/oauth/register")
+        .header("host", app.auth.authority())
+        .header("content-type", "application/json")
+        .body(HttpBody::from(
+            "{\"redirect_uris\":[],\"redirect_uris\":[]}",
+        ))
+        .unwrap();
+    let response = app.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json(response).await["error"], "invalid_client_metadata");
+    let response = app
+        .register(json!({"redirect_uris": [CALLBACK], "client_name": "x".repeat(9000)}))
+        .await;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn dcr_limits_recover_without_evicting_active_clients() {
+    let app = App::new();
+    let active = app.dynamic().await;
+    let tokens = active.tokens().await;
+    let pending = app.dynamic().await;
+    let (cookie, nonce) = pending.begin().await;
+    let coded = app.dynamic().await;
+    let code = coded.code().await;
+    let abandoned = app.dynamic().await;
+    let metadata = json!({"redirect_uris": [CALLBACK]});
+    let mut reached_rate = false;
+    for _ in 0..20 {
+        if app.register(metadata.clone()).await.status() == StatusCode::TOO_MANY_REQUESTS {
+            reached_rate = true;
+            break;
+        }
+    }
+    assert!(reached_rate);
+    let mut reached_capacity = false;
+    for _ in 0..200 {
+        app.auth.0.store.lock().unwrap().registration_rate.0 =
+            Instant::now() - Duration::from_secs(61);
+        if app.register(metadata.clone()).await.status() == StatusCode::SERVICE_UNAVAILABLE {
+            reached_capacity = true;
+            break;
+        }
+    }
+    assert!(reached_capacity);
+    {
+        let mut store = app.auth.0.store.lock().unwrap();
+        for (_, expiry) in store.registrations.values_mut() {
+            if let Some(expiry) = expiry {
+                *expiry = Instant::now() - Duration::from_secs(1);
+            }
+        }
+    }
+    assert_eq!(app.register(metadata).await.status(), StatusCode::CREATED);
+    assert_eq!(
+        active
+            .refresh(tokens["refresh_token"].as_str().unwrap(), None)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert!(
+        App::callback(pending.consent(&cookie, &nonce, OWNER, "approve").await)
+            .await
+            .contains_key("code")
+    );
+    assert_eq!(
+        coded.exchange(&code, VERIFIER, RESOURCE).await.status(),
+        StatusCode::OK
+    );
+    assert!(
+        app.auth
+            .0
+            .store
+            .lock()
+            .unwrap()
+            .clients
+            .check(&abandoned.client_id, None)
+            .is_err()
+    );
+    assert_eq!(
+        app.exchange(&app.code().await, VERIFIER, RESOURCE)
+            .await
+            .status(),
+        StatusCode::OK
     );
 }
 

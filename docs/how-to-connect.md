@@ -95,14 +95,17 @@ to keep qmcp private. Your account/workspace must allow tunnels and custom MCP s
 ## OAuth over HTTPS (ChatGPT)
 
 For embedded single-owner OAuth, run `qmcp --transport http --oauth-local-config
-local-oauth.json` behind an HTTPS proxy. The JSON fields are `resource` (the public
-HTTPS `/mcp` URL), `client_id` (a preconfigured public client), `redirect_uri`
-(the client's exact HTTPS callback), and `owner_secret_file`. The secret must be
+local-oauth.json` behind an HTTPS proxy. The required JSON fields are `resource`
+(the public HTTPS `/mcp` URL) and `owner_secret_file`. Clients can register through
+DCR at `/oauth/register` (public clients with PKCE); alternatively, configure both
+`client_id` and `redirect_uri` for a preconfigured client. The owner secret must be
 32 random bytes encoded as 64 hex characters in a private regular file with mode
 `0600`; embedded OAuth requires Unix. Forward `/mcp`, `/oauth/*`, and
 `/.well-known/*`. Only owner consent accepts the same-origin browser POST.
-Tokens are in-memory; restart requires reauthorization. Dynamic registration is
-not supported. Live ChatGPT sign-in has not been verified.
+Client creation is limited to 10/minute and 128 clients; unused dynamic
+registrations can be reclaimed after an hour without evicting active grants.
+Registrations and tokens are in-memory; restart requires reconnecting and
+reauthorization. Live ChatGPT sign-in has not been verified.
 
 ### External provider
 
